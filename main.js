@@ -106,7 +106,9 @@ function cmdEnv({ plain = false } = {}) {
 }
 
 const send = (channel, msg) => {
-  if (win && !win.isDestroyed()) win.webContents.send(channel, msg);
+  if (!win || win.isDestroyed()) return false;
+  win.webContents.send(channel, msg);
+  return true;
 };
 
 const expandHome = (p) => (p === '~' || p.startsWith('~/') ? path.join(os.homedir(), p.slice(1)) : p);
@@ -131,6 +133,11 @@ function startSessions() {
       const env = { ...cmdEnv({ plain: true }), TERM_PROGRAM: 'Loom' };
       delete env.COLUMNS; // the PTY's size is the source of truth
       delete env.LINES;
+      if (settings().realPager) {
+        delete env.PAGER;
+        delete env.GIT_PAGER;
+        env.__LOOM_REAL_PAGER = '1';
+      }
       return env;
     },
     onData: (id, chunks) => send('cmd:data', { id, chunks }),
@@ -194,6 +201,7 @@ function runSpawned({ id, command, cwd, stdin }) {
         text = `\n[loom: output truncated after ${MAX_OUTPUT / 1048576} MB]\n`;
       }
       const last = p.buf[p.buf.length - 1];
+      text = text.replace(/\r?\n/g, '\r\n'); // the renderer's terminal model expects a TTY's line endings
       if (last && last[0] === stream) last[1] += text; else p.buf.push([stream, text]);
       if (!p.timer) p.timer = setTimeout(flush, 24);
     };
@@ -248,7 +256,8 @@ ipcMain.handle('cmd:stdin', (_e, { id, data, eof }) => {
   return true;
 });
 
-ipcMain.handle('cmd:resize', (_e, { cols, rows }) => { if (sessions) sessions.resize(cols, rows); });
+ipcMain.handle('cmd:resize', (_e, { id, cols, rows }) => { if (sessions) sessions.resize(id, cols, rows); });
+ipcMain.handle('cmd:ack', (_e, { id, bytes }) => { if (sessions) sessions.ack(id, bytes); });
 ipcMain.handle('cmd:forget', (_e, id) => { if (sessions) sessions.forget(id); });
 
 // ---------------------------------------------------------------- structured data for rich views
@@ -364,6 +373,7 @@ ipcMain.handle('settings:get', () => {
     hasKey: !!getApiKey(),
     keyFromEnv: !!process.env.ANTHROPIC_API_KEY,
     forceColor: !!s.forceColor,
+    realPager: !!s.realPager,
     shell: pickShell(),
   };
 });
@@ -372,6 +382,8 @@ ipcMain.handle('settings:set', (_e, patch) => {
   const s = settings();
   if (typeof patch.model === 'string' && patch.model.trim()) s.model = patch.model.trim();
   if (typeof patch.forceColor === 'boolean') s.forceColor = patch.forceColor;
+  const pagerChanged = typeof patch.realPager === 'boolean' && patch.realPager !== !!s.realPager;
+  if (pagerChanged) s.realPager = patch.realPager;
   if (typeof patch.apiKey === 'string') {
     if (!patch.apiKey) { delete s.apiKey; delete s.keyEncrypted; }
     else if (safeStorage.isEncryptionAvailable()) {
@@ -380,6 +392,7 @@ ipcMain.handle('settings:set', (_e, patch) => {
     } else { s.apiKey = patch.apiKey; s.keyEncrypted = false; }
   }
   writeJSON(file('settings.json'), s);
+  if (pagerChanged && sessions) sessions.dropIdle();
   return true;
 });
 
@@ -396,6 +409,7 @@ ipcMain.handle('session:load', () => {
   if (!persistSession) return null;
   const saved = readJSON(file('session.json'), null);
   pruneSnapshots(saved);
+  if (sessions) sessions.resetFlow();
   return saved;
 });
 ipcMain.handle('session:save', (_e, data) => {
@@ -411,8 +425,27 @@ ipcMain.handle('sys:info', () => ({
   shell: path.basename(pickShell()),
   smoke: !!SMOKE,
   smokeResume: !!process.env.LOOM_SMOKE_RESUME,
+  e2e: SMOKE ? { sudoPass: process.env.E2E_SUDO_PASS || '', ssh: !!process.env.E2E_SSH } : null,
   sessions: !!sessions,
 }));
+
+// Real keyboard input for the e2e run. Each key is a character or a keyCode,
+// optionally with modifiers, so it goes through the page's focus and key handlers.
+ipcMain.handle('smoke:keys', async (_e, keys) => {
+  if (!SMOKE || !win) return;
+  win.webContents.focus();
+  for (const k of keys) {
+    const { key, modifiers = /^[A-Z]$/.test(k) ? ['shift'] : [] } = typeof k === 'string' ? { key: k } : k;
+    win.webContents.sendInputEvent({ type: 'keyDown', keyCode: key, modifiers });
+    if (key.length === 1 && !modifiers.includes('control') && !modifiers.includes('meta')) {
+      win.webContents.sendInputEvent({ type: 'char', keyCode: key, modifiers });
+    }
+    win.webContents.sendInputEvent({ type: 'keyUp', keyCode: key, modifiers });
+    await new Promise((r) => setTimeout(r, 15));
+  }
+});
+
+ipcMain.handle('smoke:resize', (_e, { width, height }) => { if (SMOKE && win) win.setSize(width, height); });
 
 // test/e2e.js reads these lines.
 ipcMain.handle('smoke:report', (_e, results) => {

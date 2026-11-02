@@ -6,6 +6,9 @@ node_modules/
 .env.*
 !.env.example
 
+# Copied from node_modules by postinstall
+renderer/vendor/
+
 # Build / packaging output
 dist/
 out/

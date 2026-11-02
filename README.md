@@ -1,6 +1,6 @@
 # Loom
 
-A spatial, intelligent terminal. Every command you run becomes a card on an infinite canvas. You can branch from any card, pipe one card's output into another, see output as real UI instead of text, and ask Claude when you don't remember the flags.
+A spatial, intelligent terminal. Every command you run becomes a card on an infinite canvas, and anything that works in iTerm or Terminal.app works in a card. You can branch from any card, pipe one card's output into another, see output as real UI instead of text, and ask Claude when you don't remember the flags.
 
 ## Run it
 
@@ -25,6 +25,12 @@ To use the Claude features, open **Settings** and paste an Anthropic API key. Yo
 **Pipes between cards.** The ↓ button on a card feeds its output to the next command's stdin, and a dashed blue edge links the two. This lets you rerun the downstream step without rerunning the expensive one.
 
 **Real shell on every branch.** Each branch has one long-lived interactive shell, loaded with your normal rc files. `export`, `cd`, `source .venv/bin/activate`, `nvm use`, aliases and functions all carry over to the next card. Branching from an earlier card starts a new shell with that card's directory and exported variables, so later changes on the old branch don't leak in. A card's environment is saved with the session, so you can keep branching from it after restarting Loom.
+
+**Live terminals.** While a command runs, its card is a real terminal: type straight into `python3`, `sudo`, `npm init` or `ssh`. Programs that take over the screen (vim, top, less, man, fzf) expand into a large overlay and return to the card when they exit. A finished card turns back into light, selectable text and keeps only what stayed on the normal screen.
+- A new running card takes the keyboard unless you've started typing in the composer. Press Esc twice, or ⌘/Ctrl+Shift+E, to give it back.
+- The Expand button opens any running card in the overlay.
+- Below 60% zoom, or when off-screen, a running card shows a snapshot instead of a live terminal.
+- What you type into a terminal is never stored.
 
 **Rich output views.** For a few command types, Loom renders the output as interactive UI. A **Raw** tab is always one click away.
 
@@ -52,8 +58,8 @@ To use the Claude features, open **Settings** and paste an Anthropic API key. Yo
 | Enter | Run (or ask Claude, in ✦ mode) |
 | Tab | Toggle shell / ask Claude |
 | ↑ / ↓ | Command history |
-| Ctrl+C | Stop the active card's process |
-| Ctrl+D | Close the active process's stdin (EOF) |
+| Ctrl+C | Stop the active card's process (from the composer) |
+| Ctrl+D | Send EOF to the active process (from the composer) |
 | Esc | Dismiss suggestion → cancel pipe → clear input |
 | ⌘/Ctrl+K or `/` | Focus the composer |
 | Alt+↑ / ↓ / ← / → | Move to parent / child / sibling card |
@@ -61,9 +67,19 @@ To use the Claude features, open **Settings** and paste an Anthropic API key. Yo
 | ⌘/Ctrl+N | Start a new root |
 | ⌘/Ctrl+B | Toggle the map |
 
+In a live terminal, every key goes to the program, including Ctrl+C, Ctrl+D, Ctrl+Z, arrows, Tab and Esc. The exceptions:
+
+| Keys | Action |
+|---|---|
+| Esc Esc | Return to the canvas and composer (the first Esc still reaches the program) |
+| ⌘/Ctrl+Shift+E | Return to the canvas and composer |
+| ⌘/Ctrl+Shift+F | Find in the terminal |
+| ⌘ shortcuts (macOS) | Work as usual. On Linux and Windows, Ctrl shortcuts go to the program. |
+| Ctrl+Shift+C | Copy the selection |
+
 ## How it's built
 
-There's no bundler or framework. The one runtime dependency is `node-pty`, a native module that `postinstall` rebuilds for Electron.
+There's no bundler or framework. The runtime dependencies are `node-pty`, a native module that `postinstall` rebuilds for Electron, and xterm.js with its fit, webgl, unicode11, web-links and search addons, which `postinstall` copies to `renderer/vendor/` (`scripts/vendor.js`) so plain `<script>` tags work under `script-src 'self'`.
 
 ```
 main.js       Electron main: routes commands, fs/git queries for rich views, Claude API
@@ -73,6 +89,7 @@ lib/
 preload.js    contextBridge API (the renderer has no Node access)
 renderer/
   app.js      canvas, cards, layout, composer, Claude flows, map, minimap, persistence
+  terminals.js  terminal model per running card, live views, overlay, buffer → text
   views.js    rich-view detection + renderers (files, JSON, tables, git graph, git status)
   ansi.js     ANSI color → HTML
   styles.css  dark and light themes (follows the OS)
@@ -93,11 +110,26 @@ test/
 - A card's pipe input is a temp file on `source <script> < <file>`, so it applies to the whole command, not its last pipeline stage.
 - If a shell can't start (an rc that hangs or `exec`s something else, or `node-pty` failing to load), the card runs on the old one-process-per-card path with a note in its output. Windows and shells other than bash and zsh always use that path.
 
+**Terminals.** `renderer/terminals.js` gives every running card an xterm `Terminal`.
+- The Terminal starts unattached to the DOM, as a model that interprets redraws. A quick command is over before it's ever opened, so it costs little.
+- A card that's active for 150 ms, or clicked, gets a live view: the same Terminal opened in `#live-layer`, an unscaled layer over the card. It's repositioned on pan and zoom, and the font size follows the zoom, because xterm blurs and misplaces the mouse under CSS transforms.
+- At most 8 live views exist at once, each with a WebGL context (xterm's default renderer takes over if WebGL fails). The least recently focused goes back to model plus snapshot.
+- The alternate screen is detected from the Terminal's own buffer switch, which covers `?1049h`, `?47h` and `?1047h` and can't be fooled by a split chunk.
+- The fit addon sizes each view, and `cmd:resize` resizes that card's PTY only. Every card starts at 120×40, so a command that finishes quickly prints at full width, even in a narrower card.
+- When a card ends, its text comes from one of two places. Output with no cursor movement keeps its raw text, which preserves tabs for tables and pipes and isn't limited by scrollback. Anything else is read from the normal-screen buffer. Either way it's stored as text with SGR colors, so Copy, pipes, rich views and the HTML renderer work as before.
+- Output reaches the renderer as raw PTY bytes with acknowledgements. Past 2 MB unacknowledged, the PTY pauses, so a program that floods output slows down as it would in a terminal, and long-lived programs are never cut off.
+- `PAGER` and `GIT_PAGER` stay `cat` so `git log` produces a finished card, while `MANPAGER` defaults to `less` so `man` is interactive. **Settings → Use a real pager** drops the `cat` default; idle shells pick it up by being recreated from their snapshots.
+
 The ls and git views query the file system and git directly for structured data instead of parsing text.
 
 ## Known limits / next steps
 
-- **Cards aren't terminals yet.** Commands now have a PTY, but cards don't emulate a screen, so full-screen programs (vim, top, less) render badly. Loom warns you and offers to run them anyway. The natural next step is xterm.js, opened in a card on demand. `cmd:resize` exists for that, but nothing calls it yet.
+- **ssh cards stay running until ssh exits.** Shell-integration markers don't come back from the remote shell, so the remote session is one card, and remote commands aren't split into cards.
+- **A long-running card takes the keyboard from an empty composer**, so running a second command beside it starts with Esc Esc. Keys typed in the 150 ms before that also go to the card, so a typed-ahead password can't become a command. If the command finishes first, those keys are lost.
+- **Ctrl+Z ends the card.** The shell regains control and the card finishes with exit 148, or 20 in some shells. The job stays suspended in the branch's shell, so a child card can run `fg` or `kill %1`.
+- **Over 5 MB of output**, or output that moves the cursor, keeps only the last 10,000 lines on the finished card.
+- **Echoed input is output.** Passwords that a program hides are never seen, but anything the program echoes back lands on the card and in the session file, as it would in a terminal's scrollback.
+- A live terminal sits above other cards, even one dragged over it.
 - **stdout and stderr are merged.** A PTY has one stream, so errors are no longer tinted and a card-to-card pipe carries both.
 - **A fork inherits exported variables only.** Unexported variables, functions and aliases defined in a card, and `set`/`setopt` changes, stay in that card's shell. So a forked venv works, but its `deactivate` function isn't there. A variable your rc exports and a card `unset`s comes back in a fork. A session recreated after eviction or a restart has the same limits.
 - **Snapshots contain your exported environment in plain text**, including any tokens, in `userData/envs` (user-only permissions). They're removed with their card. `session.json` only holds their paths.
@@ -105,6 +137,7 @@ The ls and git views query the file system and git directly for structured data 
 - **Commands don't enter your shell history.** Loom turns history off in its sessions so its temp-script lines stay out of `~/.zsh_history` and `~/.bash_history`.
 - `exit` and `set -e` end a branch's shell, as they would a terminal window. The next card starts a new shell from the nearest snapshot.
 - A prompt theme that rewrites the prompt after Loom's hook loses the 133;B marker. Loom then treats 133;A plus 150 ms as ready, so this only costs a little latency.
+- Finished cards don't reflow if the card is resized, and a program that printed at a narrower live width stays wrapped at that width.
 - **Force color** now only affects the fallback path, since session commands are on a real terminal.
 - Ideas that fit the model:
   - Sticky notes on the canvas

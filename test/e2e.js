@@ -3,6 +3,8 @@
 // home directory, once per shell, then again over the saved session to check
 // that a restart recreates a card's environment. Linux needs xvfb-run.
 // Usage: node test/e2e.js [zsh|bash ...]   E2E_RC appends to the fixture rc files.
+// E2E_SHOTS=<dir> keeps the screenshots. E2E_SUDO_PASS and E2E_SSH=1 turn on the
+// sudo password and ssh checks where a test account or sshd exists.
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -27,6 +29,7 @@ function fixture(shell) {
   fs.mkdirSync(cwd);
   fs.writeFileSync(path.join(home, shell === 'zsh' ? '.zshrc' : '.bashrc'), RC(shell));
   fs.writeFileSync(path.join(cwd, 'people.csv'), 'name,team,score\nalice,eng,100\ncarol,eng,300\nbob,ops,200\n');
+  fs.writeFileSync(path.join(cwd, 'README.md'), Array.from({ length: 300 }, (_, i) => `line ${i + 1}`).join('\n'));
   fs.writeFileSync(path.join(cwd, 'package.json'), '{"name":"fixture","version":"1.0.0"}\n');
   const git = (...a) => spawnSync('git', ['-c', 'user.name=e2e', '-c', 'user.email=e2e@example.com', ...a], { cwd });
   git('init', '-q');
@@ -47,13 +50,13 @@ function launch(shell, fx, extra) {
   delete env.ELECTRON_RUN_AS_NODE;
   delete env.ZDOTDIR;
   const args = [repo];
-  if (process.getuid && process.getuid() === 0) args.push('--no-sandbox');
+  if ((process.getuid && process.getuid() === 0) || process.env.E2E_NO_SANDBOX) args.push('--no-sandbox');
   const linux = process.platform === 'linux';
   const [cmd, argv] = linux ? ['xvfb-run', ['-a', electron, ...args]] : [electron, args];
   return new Promise((resolve) => {
     const child = spawn(cmd, argv, { env, stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '';
-    const timer = setTimeout(() => { out += '\n[e2e] FAIL timed out\n'; child.kill('SIGKILL'); }, 240000);
+    const timer = setTimeout(() => { out += '\n[e2e] FAIL timed out\n'; child.kill('SIGKILL'); }, 420000);
     child.stdout.on('data', (d) => { out += d; });
     child.stderr.on('data', (d) => { out += d; });
     child.on('close', () => { clearTimeout(timer); resolve(out); });
@@ -61,6 +64,7 @@ function launch(shell, fx, extra) {
 }
 
 function report(label, out) {
+  if (process.env.E2E_LOG) fs.appendFileSync(process.env.E2E_LOG, `\n=== ${label}\n${out}`);
   const lines = out.split('\n');
   const results = lines.filter((l) => /^\[e2e\] (PASS|FAIL)/.test(l));
   const fails = results.filter((l) => l.startsWith('[e2e] FAIL'));
@@ -80,6 +84,13 @@ function report(label, out) {
     const fx = fixture(shell);
     failed += report(shell, await launch(shell, fx, {}));
     failed += report(`${shell} (restart)`, await launch(shell, fx, { LOOM_SMOKE_RESUME: '1' }));
+    const saved = fs.readFileSync(path.join(fx.root, 'userData', 'session.json'), 'utf8');
+    if (saved.includes('loom-canary-hunter2')) { console.log(`${shell} FAIL typed secret found in session.json`); failed++; }
+    else console.log(`${shell} PASS typed secret isn't in session.json`);
+    if (process.env.E2E_SHOTS) {
+      fs.mkdirSync(process.env.E2E_SHOTS, { recursive: true });
+      for (const f of fs.readdirSync(fx.root)) if (f.endsWith('.png')) fs.copyFileSync(path.join(fx.root, f), path.join(process.env.E2E_SHOTS, `${shell}-${f}`));
+    }
     fs.rmSync(fx.root, { recursive: true, force: true });
   }
   console.log(failed ? `\n${failed} failed` : '\nall passed');

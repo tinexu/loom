@@ -2,14 +2,21 @@
 // Minimal ANSI → HTML: SGR colors/styles, carriage-return overwrites,
 // backspaces; every other escape sequence is dropped.
 (function (g) {
-  const PALETTE = [
+  const DARK = [
     '#3d434d', '#f07178', '#a3d983', '#e8c278', '#7aa8f5', '#c792ea', '#6cd0d0', '#c9ced6',
     '#69707c', '#ff8f96', '#bdeb9f', '#f5d491', '#9cc0ff', '#dcabff', '#8ee6e6', '#f2f4f7',
   ];
+  // On a white card, "yellow" and "white" have to be dark enough to read.
+  const LIGHT = [
+    '#1b1f25', '#c4323b', '#237a3e', '#8a6100', '#2a5fc9', '#8a3fb5', '#14787d', '#5d6573',
+    '#4a515c', '#b8323b', '#1f6b37', '#7a5600', '#2353b0', '#7a35a3', '#106a6f', '#3f4650',
+  ];
+  const lightTheme = window.matchMedia('(prefers-color-scheme: light)');
+  const palette = () => (lightTheme.matches ? LIGHT : DARK);
   const RE = /\x1b\[([0-9;?]*)([ -\/]*[@-~])|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|\x1b[=>78DEHMc]/g;
 
   function c256(n) {
-    if (n < 16) return PALETTE[n];
+    if (n < 16) return palette()[n];
     if (n < 232) {
       n -= 16;
       const v = (x) => (x ? x * 40 + 55 : 0);
@@ -50,10 +57,10 @@
       else if (c === 23) st.italic = false;
       else if (c === 24) st.underline = false;
       else if (c === 27) st.inverse = false;
-      else if (c >= 30 && c <= 37) st.fg = PALETTE[c - 30];
-      else if (c >= 90 && c <= 97) st.fg = PALETTE[c - 90 + 8];
-      else if (c >= 40 && c <= 47) st.bg = PALETTE[c - 40];
-      else if (c >= 100 && c <= 107) st.bg = PALETTE[c - 100 + 8];
+      else if (c >= 30 && c <= 37) st.fg = palette()[c - 30];
+      else if (c >= 90 && c <= 97) st.fg = palette()[c - 90 + 8];
+      else if (c >= 40 && c <= 47) st.bg = palette()[c - 40];
+      else if (c >= 100 && c <= 107) st.bg = palette()[c - 100 + 8];
       else if (c === 39) delete st.fg;
       else if (c === 49) delete st.bg;
       else if (c === 38 || c === 48) {
@@ -98,5 +105,5 @@
     return out;
   }
 
-  g.Ansi = { toHtml, strip, escapeHtml, normalize };
+  g.Ansi = { toHtml, strip, escapeHtml, normalize, palette, lightTheme };
 })(window);

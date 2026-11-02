@@ -11,7 +11,7 @@
   const GAP_X = 72;
   const GAP_Y = 64;
   const ANCHOR = 23; // x offset of the status dot, where edges attach
-  const TUI = new Set(['vim', 'vi', 'nvim', 'nano', 'emacs', 'pico', 'top', 'htop', 'btop', 'less', 'more', 'man', 'tmux', 'screen', 'watch', 'mc', 'ranger', 'lazygit', 'tig', 'fzf', 'k9s']);
+  const LIVE_DELAY = 150; // quick commands finish before they'd need a terminal
   const OS_NAME = { darwin: 'macOS', linux: 'Linux', win32: 'Windows' }[sys.platform] || sys.platform;
 
   const els = {
@@ -37,6 +37,37 @@
     suggestion: null,
   };
   const dom = new Map(); // node id -> element refs (kept out of the saved state)
+
+  const terminals = window.Terminals.create({
+    api,
+    layer: $('#live-layer'),
+    overlay: $('#term-overlay'),
+    slot: $('#term-slot'),
+    rect: cardBodyRect,
+    onChange: (n) => { updateCard(n); schedule(n); },
+    onOutput: (n) => schedule(n),
+    onAlt(n, entered) {
+      if (!entered) { terminals.collapse(); return; }
+      if (n.id === state.activeId && !n.noExpand) terminals.expand(n);
+    },
+    onRelease: () => focusPrompt(),
+    onPointer: (n) => { if (n.id !== state.activeId) setActive(n.id); terminals.show(n, { focus: true }); },
+  });
+
+  // Where a card's body is on screen, for the live terminal laid over it.
+  function cardBodyRect(n) {
+    const d = dom.get(n.id);
+    if (!d) return null;
+    const { x, y, k } = state.view;
+    return {
+      x: (n.x + d.card.clientLeft + d.body.offsetLeft) * k + x,
+      y: (n.y + d.card.clientTop + d.body.offsetTop) * k + y,
+      w: d.body.clientWidth * k,
+      h: n.bodyH * k,
+      k,
+      shown: !n.collapsed,
+    };
+  }
 
   // ================================================================ utils
   const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -85,6 +116,7 @@
     spark: '<svg viewBox="0 0 16 16"><path d="M8 1.5l1.6 4.9 4.9 1.6-4.9 1.6L8 14.5l-1.6-4.9L1.5 8l4.9-1.6z" fill="currentColor" stroke="none"/></svg>',
     copy: '<svg viewBox="0 0 16 16"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 3.5v-.5A1.5 1.5 0 0 0 9 1.5H4A1.5 1.5 0 0 0 2.5 3v5A1.5 1.5 0 0 0 4 9.5h.5"/></svg>',
     close: '<svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg>',
+    expand: '<svg viewBox="0 0 16 16"><path d="M9.5 2.5h4v4M13.5 2.5L9 7M6.5 13.5h-4v-4M2.5 13.5L7 9"/></svg>',
   };
 
   // ================================================================ toasts
@@ -129,6 +161,7 @@
         <span class="card-meta"></span>
         <div class="card-actions">
           <button data-act="stop" title="Stop (Ctrl+C)">${ICON.stop}</button>
+          <button data-act="expand" title="Expand terminal">${ICON.expand}</button>
           <button data-act="rerun" title="Run again">${ICON.rerun}</button>
           <button data-act="branch" title="Branch from here">${ICON.branch}</button>
           <button data-act="pipe" title="Pipe output into a new command">${ICON.pipe}</button>
@@ -140,20 +173,12 @@
       <div class="card-sub"><span class="card-cwd"></span><span class="card-tabs"></span></div>
       <div class="card-body"></div>
       <div class="card-ai" hidden></div>
-      <div class="card-stdin" hidden>
-        <input placeholder="Send a line to the running process" spellcheck="false">
-        <button data-act="eof" title="Close the process's input (Ctrl+D)">EOF</button>
-      </div>
       <div class="card-resize" title="Drag to resize"></div>`;
     const q = (s) => c.querySelector(s);
     dom.set(n.id, {
       card: c, id: q('.card-id'), cmd: q('.card-cmd'), meta: q('.card-meta'), cwd: q('.card-cwd'),
-      tabs: q('.card-tabs'), body: q('.card-body'), ai: q('.card-ai'), stdin: q('.card-stdin'),
+      tabs: q('.card-tabs'), body: q('.card-body'), ai: q('.card-ai'),
       richFor: null,
-    });
-    q('.card-stdin input').addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') { api.stdin({ id: n.id, data: `${e.target.value}\n` }); e.target.value = ''; }
-      if (e.key === 'd' && e.ctrlKey) { e.preventDefault(); api.stdin({ id: n.id, eof: true }); }
     });
     els.cards.append(c);
     updateCard(n);
@@ -164,11 +189,13 @@
     const d = dom.get(n.id);
     if (!d) return;
     const c = d.card;
-    c.className = `card s-${n.status}${n.id === state.activeId ? ' active' : ''}${n.collapsed ? ' collapsed' : ''}${n.pipeFrom != null ? ' piped' : ''}`;
+    const live = terminals.isLive(n.id);
+    c.className = `card s-${n.status}${n.id === state.activeId ? ' active' : ''}${n.collapsed ? ' collapsed' : ''}${n.pipeFrom != null ? ' piped' : ''}${live ? ' has-live' : ''}`;
     c.style.left = `${n.x}px`;
     c.style.top = `${n.y}px`;
     c.style.width = `${n.w}px`;
     d.body.style.maxHeight = `${n.bodyH}px`;
+    d.body.style.height = live ? `${n.bodyH}px` : '';
     d.id.textContent = `#${n.id}`;
     d.cmd.textContent = n.cmd;
     d.cmd.title = n.cmd;
@@ -176,7 +203,6 @@
     d.cwd.textContent = tp.length > 5 ? `…/${tp.slice(-3).join('/')}` : tp.join('/');
     d.cwd.title = n.cwd;
     d.meta.textContent = metaText(n);
-    d.stdin.hidden = n.status !== 'running';
     renderTabs(n);
     renderAi(n);
   }
@@ -242,6 +268,11 @@
       return;
     }
     d.richFor = null;
+    if (n.status === 'running' && terminals.refresh(n, () => schedule(n))) {
+      body.className = 'card-body raw';
+      body.textContent = '';
+      return;
+    }
     const atBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 24;
     body.className = 'card-body raw';
     if (!n.segs.length) {
@@ -324,6 +355,7 @@
       for (const id of dirty) { const n = state.nodes.get(id); if (n) renderBody(n); }
       dirty.clear();
       pushDown();
+      terminals.layout();
       drawEdges();
       drawMinimap();
       renderTreeSoon();
@@ -458,6 +490,7 @@
     els.viewport.style.backgroundSize = `${22 * k}px ${22 * k}px`;
     els.zoomLabel.textContent = `${Math.round(k * 100)}%`;
     els.viewport.classList.toggle('far', k < 0.55);
+    terminals.layout();
     drawMinimap();
     saveSoon();
   }
@@ -560,6 +593,7 @@
       zoomAt(e.clientX, e.clientY, Math.exp(-e.deltaY * (e.ctrlKey && !e.metaKey ? 0.01 : 0.0025)));
       return;
     }
+    if (e.target.closest('.live-term')) return; // xterm scrolls or sends it to the program
     const sc = e.target.closest('.card-body, .rv-table-wrap, .card-ai');
     if (sc) {
       const vertical = Math.abs(e.deltaY) >= Math.abs(e.deltaX);
@@ -579,6 +613,7 @@
     const n = state.nodes.get(Number(card.dataset.id));
     if (!n) return;
     if (n.id !== state.activeId) setActive(n.id);
+    if (n.status === 'running' && e.target.closest('.card-body')) terminals.show(n, { focus: true });
 
     const resize = e.target.closest('.card-resize');
     const head = e.target.closest('.card-head');
@@ -608,6 +643,7 @@
           const d = dom.get(m.id);
           d.card.style.left = `${m.x}px`; d.card.style.top = `${m.y}px`;
         }
+        terminals.layout();
         drawEdges();
         drawMinimap();
       };
@@ -648,6 +684,7 @@
   function cardAction(n, act) {
     switch (act) {
       case 'stop': stop(n); break;
+      case 'expand': n.noExpand = false; terminals.expand(n); break;
       case 'rerun':
         if (n.status === 'running') return;
         start(n);
@@ -664,7 +701,6 @@
         navigator.clipboard.writeText(Ansi.strip(allOutput(n))).then(() => toast('Output copied', { timeout: 1600 }));
         break;
       case 'delete': removeNode(n); break;
-      case 'eof': api.stdin({ id: n.id, eof: true }); break;
       case 'showall': n.showAll = true; schedule(n); break;
       default:
     }
@@ -684,6 +720,7 @@
     }
     if (state.pipeFrom === n.id) setPipe(null);
     state.nodes.delete(n.id);
+    terminals.dispose(n.id);
     api.forget(n.id);
     dom.get(n.id).card.remove();
     dom.delete(n.id);
@@ -693,17 +730,9 @@
   }
 
   // ================================================================ running commands
-  function runCommand(raw, { parentId = state.activeId, pipeFrom = null, force = false } = {}) {
+  function runCommand(raw, { parentId = state.activeId, pipeFrom = null } = {}) {
     const cmd = raw.trim();
     if (!cmd) return null;
-    const first = Views.tokenize(cmd).tokens[0] || '';
-    if (!force && TUI.has(first)) {
-      toast(`${first} needs a full-screen terminal, which Loom doesn't emulate yet.`, {
-        action: 'Run anyway', timeout: 7000,
-        onAction: () => runCommand(cmd, { parentId, pipeFrom, force: true }),
-      });
-      return null;
-    }
     if (cmd === 'clear' || cmd === 'reset') { newRoot(); return null; }
     const parent = parentId != null ? state.nodes.get(parentId) : null;
     const n = makeNode({
@@ -715,7 +744,7 @@
     placeNode(n, parent);
     pushHistory(cmd);
     start(n);
-    setActive(n.id);
+    setActive(n.id, { takeKeyboard: true });
     requestAnimationFrame(() => reveal(n));
     return n;
   }
@@ -724,9 +753,12 @@
     Object.assign(n, {
       status: 'running', segs: [], rich: null, ai: null, exitCode: null,
       startedAt: Date.now(), endedAt: null, killed: false, showAll: false, view: 'rich', envFile: null,
+      noExpand: false,
     });
+    terminals.attach(n);
     const src = n.pipeFrom != null ? state.nodes.get(n.pipeFrom) : null;
     if (n.pipeFrom != null && !src) n.pipeFrom = null;
+    if (src) terminals.snapshotNow(src);
     updateCard(n);
     schedule(n);
     const parent = state.nodes.get(n.parentId);
@@ -747,21 +779,22 @@
   api.onData(({ id, chunks }) => {
     const n = state.nodes.get(id);
     if (!n) return;
-    for (const [s, t] of chunks) {
-      const last = n.segs[n.segs.length - 1];
-      if (last && last[0] === s) last[1] += t; else n.segs.push([s, t]);
-    }
-    schedule(n);
+    for (const [, t] of chunks) terminals.write(n, t);
   });
 
   api.onExit(async ({ id, code, signal, cwd, envFile }) => {
     const n = state.nodes.get(id);
     if (!n) return;
+    const ended = await terminals.finish(n);
+    if (!state.nodes.has(id)) return;
+    n.segs = ended && ended.text ? [[0, ended.text]] : [];
     n.exitCode = code;
     n.endedAt = Date.now();
     n.cwdAfter = cwd;
     n.envFile = envFile || null;
-    n.status = n.killed || signal ? 'killed' : code === 0 ? 'ok' : 'error';
+    // 130 is Ctrl+C, typed into the live terminal or sent by Stop.
+    n.status = n.killed || signal || code === 130 ? 'killed' : code === 0 ? 'ok' : 'error';
+    if (ended && ended.focused) focusPrompt();
     updateCard(n);
     schedule(n);
     if (id === state.activeId) updateComposer();
@@ -785,12 +818,21 @@
   }, 500);
 
   // ================================================================ active card / composer
-  function setActive(id) {
+  function setActive(id, { takeKeyboard = false } = {}) {
     const prev = state.nodes.get(state.activeId);
     state.activeId = id;
     if (prev) updateCard(prev);
     const n = state.nodes.get(id);
     if (n) updateCard(n);
+    if (n && n.status === 'running') {
+      n.justRun = takeKeyboard;
+      setTimeout(() => {
+        n.justRun = false;
+        if (n.status !== 'running' || state.activeId !== n.id) return;
+        terminals.show(n, { focus: takeKeyboard && composerIdle() });
+        if (terminals.inAlt(n.id) && !n.noExpand) terminals.expand(n);
+      }, LIVE_DELAY);
+    }
     updateComposer();
     drawEdges();
     renderTreeSoon();
@@ -834,7 +876,11 @@
     els.hint.textContent = ai ? 'Tab · back to shell' : 'Tab · ask Claude';
   }
 
-  function focusPrompt() { els.prompt.focus(); }
+  function focusPrompt() { terminals.collapse(); els.prompt.focus(); }
+
+  // A new running card takes the keyboard, so sudo and REPLs work straight away,
+  // unless the user has already started typing something else.
+  const composerIdle = () => !els.prompt.value.trim() && !state.suggestion && !$('#settings').open;
 
   function pushHistory(cmd) {
     if (state.history[state.history.length - 1] !== cmd) state.history.push(cmd);
@@ -850,7 +896,20 @@
 
   els.mode.addEventListener('click', () => setMode(state.mode === 'ai' ? 'shell' : 'ai'));
 
+  // Keys typed before a new card's terminal opens belong to that card, not the
+  // composer: this could be a sudo password, which must never become a command.
+  function forwardTypeahead(e) {
+    const n = state.nodes.get(state.activeId);
+    if (els.prompt.value || !n || n.status !== 'running' || !n.justRun) return false;
+    if (e.ctrlKey || e.metaKey || e.altKey || (e.key.length > 1 && e.key !== 'Enter')) return false;
+    e.preventDefault();
+    api.stdin({ id: n.id, data: e.key === 'Enter' ? '\r' : e.key });
+    terminals.show(n, { focus: true });
+    return true;
+  }
+
   els.prompt.addEventListener('keydown', (e) => {
+    if (forwardTypeahead(e)) return;
     const v = els.prompt.value;
     if (e.key === 'Enter' && !e.isComposing) {
       e.preventDefault();
@@ -906,7 +965,7 @@ Respond with only a JSON object (no prose, no code fences):
 - command: a single line; chain with && or pipes when needed. Prefer tools available by default on the stated OS, and quote paths that contain spaces.
 - explanation: one or two short, plain sentences saying what it does and calling out any non-obvious flags.
 - risk: "destructive" if it deletes, overwrites, force-pushes, or otherwise can't be undone; "caution" if it modifies files, installs software, or touches the network in a meaningful way; otherwise "safe".
-- Output is captured into a card, so avoid editors, pagers and full-screen programs.
+- Commands run in a real terminal, but prefer non-interactive forms unless the user asks for an interactive program.
 - If a shell command can't do what was asked, set command to "" and explain why in explanation.`;
 
   async function ask(text) {
@@ -1173,13 +1232,14 @@ Respond with only a JSON object (no prose, no code fences):
     $('#set-key-remove').hidden = !s.hasKey || s.keyFromEnv;
     $('#set-model').value = s.model;
     $('#set-color').checked = s.forceColor;
+    $('#set-pager').checked = s.realPager;
     $('#set-shell').textContent = `Shell: ${s.shell}. Keys are stored with your OS keychain encryption when available.`;
     if (!dlg.open) dlg.showModal();
     if (note) $('#set-key').focus();
   }
   dlg.addEventListener('close', async () => {
     if (dlg.returnValue !== 'save') return;
-    const patch = { model: $('#set-model').value, forceColor: $('#set-color').checked };
+    const patch = { model: $('#set-model').value, forceColor: $('#set-color').checked, realPager: $('#set-pager').checked };
     if ($('#set-key').value.trim()) patch.apiKey = $('#set-key').value.trim();
     await api.setSettings(patch);
     toast('Settings saved', { timeout: 1600 });
@@ -1190,7 +1250,7 @@ Respond with only a JSON object (no prose, no code fences):
   });
   $('#set-clear').addEventListener('click', () => {
     if (!window.confirm('Remove every card from the canvas? Running commands will be stopped.')) return;
-    for (const n of [...state.nodes.values()]) { if (n.status === 'running') stop(n); api.forget(n.id); }
+    for (const n of [...state.nodes.values()]) { if (n.status === 'running') stop(n); terminals.dispose(n.id); api.forget(n.id); }
     state.nodes.clear();
     for (const d of dom.values()) d.card.remove();
     dom.clear();
@@ -1220,6 +1280,8 @@ Respond with only a JSON object (no prose, no code fences):
 
   document.addEventListener('keydown', (e) => {
     const mod = e.metaKey || e.ctrlKey;
+    // Ctrl+K, Alt+arrows and the like belong to the program in a live terminal.
+    if (e.target.closest('.live-term') && !(sys.platform === 'darwin' && e.metaKey)) return;
     const typing = e.target.matches('input, textarea, [contenteditable]');
     if (mod && e.key.toLowerCase() === 'k') { e.preventDefault(); focusPrompt(); return; }
     if (mod && e.key === '0') { e.preventDefault(); fit(); return; }
@@ -1255,6 +1317,7 @@ Respond with only a JSON object (no prose, no code fences):
   const SAVE_FIELDS = ['id', 'cmd', 'cwd', 'cwdAfter', 'parentId', 'pipeFrom', 'x', 'y', 'w', 'bodyH', 'status', 'exitCode', 'startedAt', 'endedAt', 'view', 'ai', 'collapsed', 'envFile'];
   function serialize() {
     const nodes = [...state.nodes.values()].map((n) => {
+      if (n.status === 'running') terminals.snapshotNow(n);
       const o = {};
       for (const f of SAVE_FIELDS) o[f] = n[f];
       if (o.status === 'running') o.status = 'interrupted';
@@ -1466,7 +1529,7 @@ Respond with only a JSON object (no prose, no code fences):
     const e1 = await run('echo "$EVICT"; echo $$', e0);
     check('evicted session comes back from its snapshot', text(e1).split('\n')[0] === 'yes' && text(e1).split('\n')[1] !== text(e0), [text(e0), text(e1)]);
 
-    check('TUI warning still fires', runCommand('vim x') === null, null);
+    await smokeTerminals({ run, text, check, wait, done });
     const leak = [...state.nodes.values()].filter((n) => /LEAK|__loom|source '|133;/.test(text(n)));
     check('no prompt or hook text on any card', !leak.length, leak.map((n) => [n.cmd, allOutput(n).slice(0, 200)]));
 
@@ -1487,6 +1550,272 @@ Respond with only a JSON object (no prose, no code fences):
     await wait(700);
     await api.saveSession(serialize());
     api.smokeDone({ suffix: 'zoom' });
+  }
+
+  // Interactive programs, driven by real key events through the page.
+  async function smokeTerminals({ run, text, check, wait, done }) {
+    window.loomE2E = sys.e2e;
+    const until = async (fn, ms = 8000) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (fn()) return true; await wait(40); } return !!fn(); };
+    const keys = (s) => api.smokeKeys([...s]);
+    const ENTER = { key: 'Return' };
+    const ESC = { key: 'Escape' };
+    const ctrl = (key) => ({ key, modifiers: ['control'] });
+    const hatch = { key: 'E', modifiers: ['control', 'shift'] };
+    const start = (cmd) => runCommand(cmd, { parentId: null });
+    const screen = (n) => {
+      const term = terminals.term(n.id);
+      if (!term) return '';
+      const b = term.buffer.active;
+      let out = '';
+      for (let i = b.viewportY; i < b.viewportY + term.rows; i++) { const l = b.getLine(i); out += `${l ? l.translateToString(true) : ''}\n`; }
+      return out;
+    };
+    const keyboardOn = (n) => document.activeElement === (terminals.term(n.id) || {}).textarea;
+    const showing = () => [...document.querySelectorAll('.live-term')].filter((e) => !e.hidden && e.offsetParent);
+
+    // ---- vim
+    const vim = start('vim README.md');
+    check('vim: expands to the overlay', await until(() => terminals.stats().overlay === vim.id), terminals.stats());
+    await until(() => /README/.test(screen(vim)));
+    const slot = $('#term-slot').getBoundingClientRect();
+    check('vim: overlay is about 90% of the window', slot.width / window.innerWidth > 0.85 && slot.height / window.innerHeight > 0.85, [slot.width, slot.height]);
+    await wait(400);
+    const veil = getComputedStyle($('#term-overlay'));
+    check('vim: overlay is actually on screen', veil.opacity === '1' && veil.display !== 'none' && document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2).closest('#term-overlay'), [veil.opacity, veil.display]);
+    await api.smokeDone({ keep: true, suffix: 'vim' });
+    await api.smokeKeys(['i', ...'edited-in-vim', ENTER, ESC, ':', 'w', 'q', ENTER]);
+    await done(vim);
+    check('vim: :wq exits 0', vim.status === 'ok' && vim.exitCode === 0, [vim.status, vim.exitCode]);
+    check('vim: overlay closed', await until(() => terminals.stats().overlay === null) && await until(() => $('#term-overlay').hidden), terminals.stats());
+    check('vim: card keeps only the normal screen', !/edited-in-vim|~/.test(text(vim)), text(vim).slice(0, 200));
+    const edited = await run('head -1 README.md', vim);
+    check('vim: edit saved, shell still usable', text(edited) === 'edited-in-vim', text(edited));
+
+    // ---- top: redraw and resize
+    const top = start('top');
+    await until(() => /PID/.test(screen(top)));
+    await wait(500);
+    // macOS top uses the alternate screen. Linux top redraws in place, so it stays on the card.
+    check('top: expands if it takes the alternate screen', terminals.inAlt(top.id) === (terminals.stats().overlay === top.id), terminals.stats());
+    if (terminals.stats().overlay !== top.id) cardAction(top, 'expand');
+    const first = screen(top);
+    await wait(2500);
+    check('top: redraws live', screen(top) !== first, null);
+    const cols0 = terminals.term(top.id).cols;
+    await api.smokeResize({ width: 1100, height: 700 });
+    check('top: follows the window size', await until(() => terminals.term(top.id).cols !== cols0), [cols0, terminals.term(top.id).cols]);
+    await api.smokeResize({ width: 1480, height: 920 });
+
+    // ---- zoom, using top as the spec does
+    await api.smokeKeys([hatch]);
+    check('hatch: Ctrl+Shift+E closes the overlay', await until(() => terminals.stats().overlay === null) && document.activeElement === els.prompt, document.activeElement && document.activeElement.id);
+    check('hatch: no focus ring left behind', !document.querySelector('.live-term.focused'), null);
+    setActive(top.id);
+    state.view.k = 1;
+    reveal(top, true);
+    await wait(600);
+    terminals.layout();
+    check('zoom 100%: live terminal over the card', terminals.isLive(top.id), terminals.stats());
+    const host = showing().find((e) => e.querySelector('canvas, .xterm-screen')) || showing()[0];
+    const bodyBox = dom.get(top.id).body.getBoundingClientRect();
+    const hostBox = host.getBoundingClientRect();
+    check('zoom 100%: lines up with the card body', Math.abs(bodyBox.left - hostBox.left) < 2 && Math.abs(bodyBox.top - hostBox.top) < 2, [bodyBox.left, hostBox.left, bodyBox.top, hostBox.top]);
+    await api.smokeDone({ keep: true, suffix: 'live' });
+    const home = { ...state.view };
+    const box = els.viewport.getBoundingClientRect();
+    state.view = { k: 0.4, x: box.width / 2 - (top.x + top.w / 2) * 0.4, y: box.height / 3 - top.y * 0.4 };
+    applyView();
+    await wait(500);
+    const small = dom.get(top.id).card.getBoundingClientRect();
+    check('zoom 40%: the card is in view', small.left >= box.left && small.right <= box.right && small.top >= box.top && small.top < box.bottom, [small.left, small.top]);
+    check('zoom 40%: snapshot, no stray terminal', !terminals.isLive(top.id) && !showing().length, showing().length);
+    check('zoom 40%: card shows the text', /PID/.test(dom.get(top.id).body.textContent), dom.get(top.id).body.textContent.slice(0, 80));
+    await api.smokeDone({ keep: true, suffix: 'zoom40' });
+    state.view = home;
+    applyView();
+    await wait(400);
+    check('zoom back: live again', terminals.isLive(top.id), terminals.stats());
+    state.view = { ...home, x: home.x + 50000 };
+    applyView();
+    await wait(200);
+    check('off-screen: snapshot', !terminals.isLive(top.id), terminals.stats());
+    state.view = home;
+    applyView();
+    await wait(200);
+    terminals.show(top, { focus: true });
+    await until(() => keyboardOn(top));
+    await keys('q');
+    await done(top);
+    check('top: q exits 0', top.status === 'ok' && top.exitCode === 0, [top.status, top.exitCode]);
+
+    // ---- pagers
+    const less = start('less README.md');
+    await until(() => /line 1\b/.test(screen(less)) || /edited/.test(screen(less)));
+    await wait(200);
+    const page = screen(less);
+    await keys('jjjj');
+    check('less: scrolls', await until(() => screen(less) !== page), null);
+    terminals.term(less.id).input('q'); // the path a keystroke takes out of xterm
+    await done(less);
+    check('less: q exits 0', less.status === 'ok' && less.exitCode === 0, [less.status, less.exitCode]);
+    const hasMan = await run('command -v man');
+    if (hasMan.status === 'ok') {
+      const man = start('man ls');
+      const opened = await until(() => /LS\(1\)|ls\b.*list/i.test(screen(man)), 10000);
+      check('man: opens in a pager', opened, screen(man).slice(0, 200));
+      await keys('jjj');
+      await wait(200);
+      await keys('q');
+      await done(man);
+      check('man: q exits 0', man.status === 'ok' && man.exitCode === 0, [man.status, man.exitCode]);
+    }
+
+    // ---- passwords
+    const CANARY = 'loom-canary-hunter2';
+    const secret = start('read -s p && echo got');
+    await until(() => keyboardOn(secret));
+    await keys(CANARY);
+    await api.smokeKeys([ENTER]);
+    await done(secret);
+    check('read -s: input reaches the program', text(secret) === 'got', text(secret));
+    check('read -s: not on the card or in the session', !JSON.stringify(serialize()).includes(CANARY), null);
+    const sudo = start('sudo -k && sudo true');
+    const asked = await until(() => /password/i.test(screen(sudo)), 6000);
+    check('sudo: prompts on the terminal', asked, screen(sudo).slice(0, 120));
+    if (window.loomE2E && window.loomE2E.sudoPass) {
+      await keys(window.loomE2E.sudoPass);
+      await api.smokeKeys([ENTER]);
+      await done(sudo);
+      check('sudo: password accepted', sudo.status === 'ok', [sudo.status, screen(sudo)]);
+      check('sudo: password not stored', !JSON.stringify(serialize()).includes(window.loomE2E.sudoPass) && !text(sudo).includes(window.loomE2E.sudoPass), null);
+    } else {
+      await api.smokeKeys([ctrl('C')]);
+      await done(sudo);
+      check('sudo: ^C abandons the prompt', sudo.status !== 'running', sudo.status);
+    }
+
+    // ---- interactive programs
+    const py = start('python3');
+    await until(() => keyboardOn(py));
+    await until(() => />>>/.test(screen(py)), 10000);
+    await api.smokeKeys([...'1+1', ENTER]);
+    check('python: REPL answers', await until(() => /^2$/m.test(screen(py))), screen(py));
+    await api.smokeKeys([...'exit()', ENTER]);
+    await done(py);
+    check('python: exit() ends the card', py.status === 'ok', py.status);
+
+    const npm = start('mkdir -p npmt && cd npmt && npm init');
+    await until(() => /package name/.test(screen(npm)), 20000);
+    await api.smokeKeys([...'answered-name', ENTER]);
+    for (let i = 0; i < 40 && npm.status === 'running'; i++) { await api.smokeKeys([ENTER]); await wait(200); }
+    await done(npm);
+    const pkg = await run('cat package.json', npm);
+    check('npm init: answers land in package.json', npm.status === 'ok' && /"name": "answered-name"/.test(text(pkg)), [npm.status, text(pkg).slice(0, 120)]);
+
+    if (window.loomE2E && window.loomE2E.ssh) {
+      const ssh = start('ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null localhost');
+      await until(() => /[$#] $/m.test(screen(ssh).trimEnd() + ' '), 8000);
+      await wait(500);
+      await api.smokeKeys([...'echo ssh-$((40+2))', ENTER]);
+      check('ssh: live terminal works', await until(() => /ssh-42/.test(screen(ssh))), screen(ssh).slice(-300));
+      check('ssh: stays running', ssh.status === 'running', ssh.status);
+      await api.smokeKeys([...'exit', ENTER]);
+      await done(ssh);
+      check('ssh: card ends with the connection', ssh.status === 'ok', ssh.status);
+    }
+
+    // ---- typed ahead of the terminal opening
+    els.prompt.focus();
+    const ahead = start('cat');
+    await api.smokeKeys([...'typed-ahead', ENTER]);
+    check('typeahead: reaches the new card', await until(() => /typed-ahead/.test(screen(ahead))), screen(ahead).slice(0, 80));
+    check('typeahead: never becomes a command', !state.history.includes('typed-ahead') && !els.prompt.value, els.prompt.value);
+    await api.smokeKeys([ctrl('D')]);
+    await done(ahead);
+
+    // ---- keys go to the program, not to Loom
+    const catv = start('cat -v');
+    await until(() => keyboardOn(catv));
+    await api.smokeKeys([{ key: 'Up' }, { key: 'Tab' }, ctrl('K'), ctrl('B'), ENTER]);
+    check('keys: arrows, Tab, Ctrl+K, Ctrl+B reach the program', await until(() => /\^\[\[A\s+\^K\^B/.test(screen(catv))), screen(catv).slice(0, 120));
+    check('keys: no Loom shortcut fired', els.sidebar.hidden === false && keyboardOn(catv), null);
+    await api.smokeKeys([ctrl('D')]);
+    await done(catv);
+    check('keys: Ctrl+D is EOF', catv.status === 'ok', catv.status);
+
+    const interrupted = start('sleep 30');
+    await until(() => keyboardOn(interrupted));
+    await api.smokeKeys([ctrl('C')]);
+    await done(interrupted);
+    check('keys: Ctrl+C stops the program', interrupted.status === 'killed', [interrupted.status, interrupted.exitCode]);
+    check('keys: keyboard returns to the composer when a card ends', document.activeElement === els.prompt, document.activeElement && document.activeElement.className);
+
+    const suspended = start('sleep 30');
+    await until(() => keyboardOn(suspended));
+    await api.smokeKeys([ctrl('Z')]);
+    await done(suspended);
+    check('keys: Ctrl+Z suspends and ends the card', suspended.status !== 'running', suspended.status);
+    const resumed = await run('jobs; kill %1', suspended);
+    check('keys: suspended job stays in the branch shell', /sleep 30/.test(text(resumed)), text(resumed));
+
+    const hold = start('cat');
+    await until(() => keyboardOn(hold));
+    check('hatch: hint shows while focused', (() => { const f = document.querySelector('.live-term.focused .live-hint'); return f && getComputedStyle(f).display === 'block'; })(), null);
+    await api.smokeKeys([ESC, ESC]);
+    check('hatch: Esc Esc returns to the composer', await until(() => document.activeElement === els.prompt), document.activeElement && document.activeElement.className);
+    cardAction(hold, 'expand');
+    check('expand: button opens the overlay', await until(() => terminals.stats().overlay === hold.id), terminals.stats());
+    await api.smokeKeys([hatch]);
+    check('expand: hatch closes it', await until(() => terminals.stats().overlay === null), terminals.stats());
+    stop(hold);
+    await done(hold);
+
+    els.prompt.value = 'half-typed';
+    const noSteal = start('sleep 1');
+    await wait(400);
+    check("a new card doesn't take the keyboard from a half-typed command", document.activeElement === els.prompt, document.activeElement && document.activeElement.className);
+    els.prompt.value = '';
+    await done(noSteal);
+
+    // ---- redraws, sizing, volume
+    const bar = start('for i in $(seq 1 100); do printf "\\r%3d%%" $i; sleep 0.02; done; echo');
+    await done(bar);
+    check('progress: final text is 100%', text(bar) === '100%', text(bar));
+
+    const sized = start('for i in 1 2 3 4 5 6 7 8 9 10 11 12; do stty size; sleep 0.2; done');
+    await done(sized);
+    const sizes = text(sized).split('\n');
+    check('resize: the PTY follows the card', sizes[0] === '40 120' && sizes[sizes.length - 1] !== '40 120', [sizes[0], sizes[sizes.length - 1]]);
+    const again = await run('stty size', sized);
+    check('resize: the next card starts at the default size', text(again) === '40 120', text(again));
+
+    const tsv = await run("printf 'a\\tb\\nc\\td\\n'");
+    check('tabs survive for rich views', tsv.rich && tsv.rich.kind === 'table' && stdoutOf(tsv).includes('\t'), tsv.rich && tsv.rich.kind);
+
+    const flood = await run("seq -f '%.0f' 1 1500000");
+    check('over 5 MB: card finishes with the tail and a note', flood.status === 'ok' && /^\[loom: over/.test(text(flood)) && text(flood).endsWith('1500000'), [flood.status, text(flood).slice(0, 60), text(flood).slice(-10)]);
+    const yes = start('yes');
+    await wait(1200);
+    const t0 = Date.now();
+    stop(yes);
+    await done(yes);
+    check('Stop works during a flood', yes.status === 'killed' && Date.now() - t0 < 8000, [yes.status, Date.now() - t0]);
+
+    // ---- many running cards
+    const many = [];
+    for (let i = 0; i < 15; i++) { many.push(start('sleep 100')); await wait(230); }
+    const st = terminals.stats();
+    check('15 running cards: at most 8 live terminals', st.peak <= 8 && st.live <= 8 && st.models >= 15, st);
+    setActive(many[0].id);
+    reveal(many[0], true);
+    await wait(600);
+    terminals.show(many[0], { focus: true });
+    await wait(150);
+    check('15 running cards: an old card comes back when focused', terminals.isLive(many[0].id) && terminals.stats().live <= 8, terminals.stats());
+    many.forEach(stop);
+    for (const n of many) await done(n);
+    check('15 running cards: all stop', many.every((n) => n.status === 'killed'), many.map((n) => n.status));
+    check('finished cards keep no terminal', terminals.stats().models === 0 && !document.querySelector('.live-term'), terminals.stats());
   }
 
   // Second e2e phase: a new Loom process, over the session the first one saved.

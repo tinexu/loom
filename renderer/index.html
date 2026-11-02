@@ -5,6 +5,7 @@
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:">
   <title>Loom</title>
+  <link rel="stylesheet" href="vendor/xterm.css">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -45,8 +46,11 @@
         <button class="chip" data-ask="find the 10 largest files under here">? find the 10 largest files under here</button>
       </div>
     </div>
+    <div id="live-layer"></div>
     <canvas id="minimap" width="220" height="140"></canvas>
   </main>
+
+  <div id="term-overlay" hidden><div id="term-slot"></div></div>
 
   <div id="composer">
     <div id="suggestion" hidden></div>
@@ -75,6 +79,9 @@
       <label class="check"><input type="checkbox" id="set-color"> Force color output
         <span class="muted">Shell sessions already run on a terminal, so this only affects the plain-pipe fallback. Can break in-command pipes like <code>git branch | xargs</code>.</span>
       </label>
+      <label class="check"><input type="checkbox" id="set-pager"> Use a real pager
+        <span class="muted">Commands like <code>git log</code> open your pager in a live terminal, and don't get rich views or finished cards until you quit it.</span>
+      </label>
       <p class="muted small" id="set-shell"></p>
       <div class="dialog-actions">
         <button type="button" class="danger" id="set-clear">Clear canvas</button>
@@ -85,8 +92,15 @@
     </form>
   </dialog>
 
+  <script src="vendor/xterm.js"></script>
+  <script src="vendor/addon-fit.js"></script>
+  <script src="vendor/addon-webgl.js"></script>
+  <script src="vendor/addon-unicode11.js"></script>
+  <script src="vendor/addon-web-links.js"></script>
+  <script src="vendor/addon-search.js"></script>
   <script src="ansi.js"></script>
   <script src="views.js"></script>
+  <script src="terminals.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

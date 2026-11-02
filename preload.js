@@ -9,6 +9,7 @@ contextBridge.exposeInMainWorld('loom', {
   kill: invoke('cmd:kill'),
   stdin: invoke('cmd:stdin'),
   resize: invoke('cmd:resize'),
+  ack: invoke('cmd:ack'),
   forget: invoke('cmd:forget'),
   onData: (fn) => ipcRenderer.on('cmd:data', (_e, m) => fn(m)),
   onExit: (fn) => ipcRenderer.on('cmd:exit', (_e, m) => fn(m)),
@@ -24,4 +25,6 @@ contextBridge.exposeInMainWorld('loom', {
   saveSession: invoke('session:save'),
   smokeDone: invoke('smoke:done'),
   smokeReport: invoke('smoke:report'),
+  smokeKeys: invoke('smoke:keys'),
+  smokeResize: invoke('smoke:resize'),
 });
