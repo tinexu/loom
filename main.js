@@ -1,8 +1,8 @@
 'use strict';
 // Loom — main process.
-// Runs real shell commands (one child process per card), tracks the working
-// directory across commands, and brokers file-system, git and Claude calls
-// for the renderer. The renderer never touches Node directly.
+// Routes commands to long-lived shell sessions (lib/sessions.js), or to one
+// child process per card where those aren't available, and brokers file-system,
+// git and Claude calls for the renderer. The renderer never touches Node directly.
 
 const { app, BrowserWindow, ipcMain, safeStorage, shell, nativeTheme } = require('electron');
 const path = require('path');
@@ -10,6 +10,7 @@ const fs = require('fs');
 const os = require('os');
 const { spawn, execFile } = require('child_process');
 const { StringDecoder } = require('string_decoder');
+const { createSessions } = require('./lib/sessions');
 
 const isWin = process.platform === 'win32';
 const SMOKE = process.env.LOOM_SMOKE || '';
@@ -17,12 +18,14 @@ const MAX_OUTPUT = 5 * 1024 * 1024; // per command
 const DEFAULT_MODEL = 'claude-sonnet-5-5';
 
 if (SMOKE) {
-  app.setPath('userData', path.join(os.tmpdir(), `loom-smoke-${process.pid}`));
+  // A fixed LOOM_SMOKE_USERDATA lets the e2e run restart Loom over its own session.
+  app.setPath('userData', process.env.LOOM_SMOKE_USERDATA || path.join(os.tmpdir(), `loom-smoke-${process.pid}`));
   app.disableHardwareAcceleration();
 }
 
 let win = null;
 let loginPath = process.env.PATH || '';
+let sessions = null;
 const procs = new Map();
 
 // ---------------------------------------------------------------- storage
@@ -75,6 +78,8 @@ function resolveLoginPath() {
   });
 }
 
+const envDir = () => file('envs');
+
 function cmdEnv({ plain = false } = {}) {
   const env = {
     ...process.env,
@@ -110,7 +115,33 @@ function isDir(p) {
   try { return fs.statSync(p).isDirectory(); } catch { return false; }
 }
 
-ipcMain.handle('cmd:run', (_e, { id, command, cwd, stdin }) => {
+// Windows and shells without integration hooks run one child process per card.
+function startSessions() {
+  if (isWin || !['bash', 'zsh'].includes(path.basename(pickShell()))) return;
+  let pty;
+  try { pty = require('node-pty'); } catch (err) {
+    console.warn(`node-pty unavailable, using one process per card: ${err.message}`);
+    return;
+  }
+  sessions = createSessions({
+    pty,
+    shell: pickShell(),
+    envDir: envDir(),
+    env: () => {
+      const env = { ...cmdEnv({ plain: true }), TERM_PROGRAM: 'Loom' };
+      delete env.COLUMNS; // the PTY's size is the source of truth
+      delete env.LINES;
+      return env;
+    },
+    onData: (id, chunks) => send('cmd:data', { id, chunks }),
+    onExit: (msg) => send('cmd:exit', msg),
+    fallback: runSpawned,
+  });
+}
+
+ipcMain.handle('cmd:run', (_e, req) => (sessions ? sessions.run(req) : runSpawned(req)));
+
+function runSpawned({ id, command, cwd, stdin }) {
   const dir = cwd && isDir(cwd) ? cwd : os.homedir();
   const env = cmdEnv();
   let child;
@@ -190,9 +221,10 @@ ipcMain.handle('cmd:run', (_e, { id, command, cwd, stdin }) => {
   // A background job can hold the pipes open forever; don't wait on it.
   child.on('exit', (code, signal) => setTimeout(() => finish(code, signal), 500));
   return { pid: child.pid };
-});
+}
 
 ipcMain.handle('cmd:kill', (_e, id) => {
+  if (sessions && sessions.owns(id)) return sessions.kill(id);
   const p = procs.get(id);
   if (!p) return false;
   const pid = p.child.pid;
@@ -208,12 +240,16 @@ ipcMain.handle('cmd:kill', (_e, id) => {
 });
 
 ipcMain.handle('cmd:stdin', (_e, { id, data, eof }) => {
+  if (sessions && sessions.owns(id)) return sessions.stdin(id, data, eof);
   const p = procs.get(id);
   if (!p || !p.child.stdin.writable) return false;
   if (data) p.child.stdin.write(data);
   if (eof) p.child.stdin.end();
   return true;
 });
+
+ipcMain.handle('cmd:resize', (_e, { cols, rows }) => { if (sessions) sessions.resize(cols, rows); });
+ipcMain.handle('cmd:forget', (_e, id) => { if (sessions) sessions.forget(id); });
 
 // ---------------------------------------------------------------- structured data for rich views
 ipcMain.handle('fs:list', async (_e, { cwd, target, hidden }) => {
@@ -347,9 +383,23 @@ ipcMain.handle('settings:set', (_e, patch) => {
   return true;
 });
 
-ipcMain.handle('session:load', () => (SMOKE ? null : readJSON(file('session.json'), null)));
+// Snapshots hold exported env vars, so don't keep any no card points at.
+function pruneSnapshots(saved) {
+  const keep = new Set(((saved && saved.nodes) || []).map((n) => n.envFile && path.basename(n.envFile)));
+  let names = [];
+  try { names = fs.readdirSync(envDir()); } catch { /* none yet */ }
+  for (const name of names) if (!keep.has(name)) fs.rm(path.join(envDir(), name), { force: true }, () => {});
+}
+
+const persistSession = !SMOKE || !!process.env.LOOM_SMOKE_USERDATA;
+ipcMain.handle('session:load', () => {
+  if (!persistSession) return null;
+  const saved = readJSON(file('session.json'), null);
+  pruneSnapshots(saved);
+  return saved;
+});
 ipcMain.handle('session:save', (_e, data) => {
-  if (SMOKE) return true;
+  if (!persistSession) return true;
   try { writeJSON(file('session.json'), data); return true; } catch { return false; }
 });
 
@@ -360,7 +410,16 @@ ipcMain.handle('sys:info', () => ({
   user: os.userInfo().username,
   shell: path.basename(pickShell()),
   smoke: !!SMOKE,
+  smokeResume: !!process.env.LOOM_SMOKE_RESUME,
+  sessions: !!sessions,
 }));
+
+// test/e2e.js reads these lines.
+ipcMain.handle('smoke:report', (_e, results) => {
+  if (!SMOKE) return;
+  for (const r of results) console.log(`[e2e] ${r.ok ? 'PASS' : 'FAIL'} ${r.name}${r.ok ? '' : ` :: ${r.detail}`}`);
+  console.log(`[e2e] END ${results.length}`);
+});
 
 ipcMain.handle('smoke:done', async (_e, opts = {}) => {
   if (!SMOKE || !win) return;
@@ -402,11 +461,13 @@ function createWindow() {
 
 app.whenReady().then(async () => {
   await resolveLoginPath();
+  startSessions();
   createWindow();
   app.on('activate', () => { if (!BrowserWindow.getAllWindows().length) createWindow(); });
 });
 
 app.on('before-quit', () => {
+  if (sessions) sessions.shutdown();
   for (const p of procs.values()) {
     try { isWin ? p.child.kill() : process.kill(-p.child.pid, 'SIGTERM'); } catch { /* gone */ }
   }

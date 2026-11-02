@@ -5,10 +5,17 @@
   "description": "A spatial, intelligent terminal: commands become cards on an infinite canvas.",
   "main": "main.js",
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "postinstall": "electron-rebuild -f -w node-pty",
+    "test": "node --test test/parser.test.js",
+    "e2e": "node test/e2e.js"
   },
   "license": "MIT",
   "devDependencies": {
+    "@electron/rebuild": "^4.2.1",
     "electron": "^45.2.1"
+  },
+  "dependencies": {
+    "node-pty": "^1.1.0"
   }
 }

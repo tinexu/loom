@@ -109,7 +109,7 @@
       id: state.nextId++, cmd: '', cwd: sys.home, cwdAfter: null, parentId: null, pipeFrom: null,
       x: 0, y: 0, w: CARD_W, bodyH: 300, status: 'running', exitCode: null, segs: [],
       startedAt: Date.now(), endedAt: null, rich: null, view: 'rich', ai: null, collapsed: false,
-      showAll: false, killed: false,
+      showAll: false, killed: false, envFile: null,
       ...props,
     };
     state.nodes.set(n.id, n);
@@ -684,6 +684,7 @@
     }
     if (state.pipeFrom === n.id) setPipe(null);
     state.nodes.delete(n.id);
+    api.forget(n.id);
     dom.get(n.id).card.remove();
     dom.delete(n.id);
     if (state.activeId === n.id) setActive(n.parentId != null && state.nodes.has(n.parentId) ? n.parentId : null);
@@ -722,13 +723,25 @@
   function start(n) {
     Object.assign(n, {
       status: 'running', segs: [], rich: null, ai: null, exitCode: null,
-      startedAt: Date.now(), endedAt: null, killed: false, showAll: false, view: 'rich',
+      startedAt: Date.now(), endedAt: null, killed: false, showAll: false, view: 'rich', envFile: null,
     });
     const src = n.pipeFrom != null ? state.nodes.get(n.pipeFrom) : null;
     if (n.pipeFrom != null && !src) n.pipeFrom = null;
     updateCard(n);
     schedule(n);
-    api.run({ id: n.id, command: n.cmd, cwd: n.cwd, stdin: src ? Ansi.strip(stdoutOf(src)) : undefined });
+    const parent = state.nodes.get(n.parentId);
+    api.run({
+      id: n.id, command: n.cmd, cwd: n.cwd, stdin: src ? Ansi.strip(stdoutOf(src)) : undefined,
+      parentId: parent ? parent.id : null,
+      fork: !!parent && childrenOf(parent.id).some((c) => c.id !== n.id),
+      envFile: nearestSnapshot(parent),
+    });
+  }
+
+  // A parent that's still running (or was interrupted) has no snapshot yet.
+  function nearestSnapshot(n) {
+    while (n && !n.envFile) n = state.nodes.get(n.parentId);
+    return n ? n.envFile : null;
   }
 
   api.onData(({ id, chunks }) => {
@@ -741,12 +754,13 @@
     schedule(n);
   });
 
-  api.onExit(async ({ id, code, signal, cwd }) => {
+  api.onExit(async ({ id, code, signal, cwd, envFile }) => {
     const n = state.nodes.get(id);
     if (!n) return;
     n.exitCode = code;
     n.endedAt = Date.now();
     n.cwdAfter = cwd;
+    n.envFile = envFile || null;
     n.status = n.killed || signal ? 'killed' : code === 0 ? 'ok' : 'error';
     updateCard(n);
     schedule(n);
@@ -892,7 +906,7 @@ Respond with only a JSON object (no prose, no code fences):
 - command: a single line; chain with && or pipes when needed. Prefer tools available by default on the stated OS, and quote paths that contain spaces.
 - explanation: one or two short, plain sentences saying what it does and calling out any non-obvious flags.
 - risk: "destructive" if it deletes, overwrites, force-pushes, or otherwise can't be undone; "caution" if it modifies files, installs software, or touches the network in a meaningful way; otherwise "safe".
-- Commands run without a TTY, so avoid editors, pagers and interactive prompts.
+- Output is captured into a card, so avoid editors, pagers and full-screen programs.
 - If a shell command can't do what was asked, set command to "" and explain why in explanation.`;
 
   async function ask(text) {
@@ -1176,7 +1190,7 @@ Respond with only a JSON object (no prose, no code fences):
   });
   $('#set-clear').addEventListener('click', () => {
     if (!window.confirm('Remove every card from the canvas? Running commands will be stopped.')) return;
-    for (const n of [...state.nodes.values()]) { if (n.status === 'running') stop(n); }
+    for (const n of [...state.nodes.values()]) { if (n.status === 'running') stop(n); api.forget(n.id); }
     state.nodes.clear();
     for (const d of dom.values()) d.card.remove();
     dom.clear();
@@ -1238,7 +1252,7 @@ Respond with only a JSON object (no prose, no code fences):
   window.addEventListener('resize', () => { drawMinimap(); });
 
   // ================================================================ persistence
-  const SAVE_FIELDS = ['id', 'cmd', 'cwd', 'cwdAfter', 'parentId', 'pipeFrom', 'x', 'y', 'w', 'bodyH', 'status', 'exitCode', 'startedAt', 'endedAt', 'view', 'ai', 'collapsed'];
+  const SAVE_FIELDS = ['id', 'cmd', 'cwd', 'cwdAfter', 'parentId', 'pipeFrom', 'x', 'y', 'w', 'bodyH', 'status', 'exitCode', 'startedAt', 'endedAt', 'view', 'ai', 'collapsed', 'envFile'];
   function serialize() {
     const nodes = [...state.nodes.values()].map((n) => {
       const o = {};
@@ -1299,7 +1313,18 @@ Respond with only a JSON object (no prose, no code fences):
 
   async function runSmoke() {
     const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-    const done = async (n) => { for (let i = 0; i < 100 && n && n.status === 'running'; i++) await wait(100); await wait(250); };
+    const done = async (n) => { for (let i = 0; i < 300 && n && n.status === 'running'; i++) await wait(100); await wait(250); };
+    const results = [];
+    const check = (name, ok, detail) => results.push({ name, ok: !!ok, detail: JSON.stringify(detail) });
+    const text = (n) => Ansi.strip(allOutput(n)).trim();
+    const run = async (cmd, parent = null, opts = {}) => {
+      const n = runCommand(cmd, { parentId: parent ? parent.id : null, ...opts });
+      await done(n);
+      return n;
+    };
+    if (sys.smokeResume) { await smokeResume({ run, text, check }); await api.smokeReport(results); api.smokeDone(); return; }
+
+    check('uses PTY sessions', sys.sessions, sys);
     toggleSidebar(true);
     const ls = runCommand('ls -a'); await done(ls);
     const log = runCommand('git log'); await done(log);
@@ -1311,6 +1336,144 @@ Respond with only a JSON object (no prose, no code fences):
     setActive(ls.id);
     const csv = runCommand('cat people.csv'); await done(csv);
     const ps = runCommand('ps -eo pid,user,comm | head -6', { parentId: csv.id }); await done(ps);
+
+    check('ls: file grid', ls.status === 'ok' && ls.rich && ls.rich.kind === 'files', ls.rich && ls.rich.kind);
+    check('git log: graph', log.status === 'ok' && log.rich && log.rich.kind === 'gitlog', log.rich && log.rich.kind);
+    check('git status: view', st.status === 'ok' && st.rich && st.rich.kind === 'gitstatus', st.rich && st.rich.kind);
+    check('missing file: red card', bad.status === 'error' && bad.exitCode === 1, [bad.status, bad.exitCode]);
+    check('cat json: tree view', json.rich && json.rich.kind === 'json', json.rich && json.rich.kind);
+    check('cat csv: table view', csv.rich && csv.rich.kind === 'table', csv.rich && csv.rich.kind);
+    check('no carriage returns in output', !stdoutOf(csv).includes('\r'), JSON.stringify(stdoutOf(csv).slice(0, 40)));
+
+    const sorted = await run('sort -t, -k3 -nr', csv, { pipeFrom: csv.id });
+    check('pipe: sort reads the source card', text(sorted).split('\n')[0] === 'carol,eng,300', text(sorted));
+    const piped = await run('a=$(cat)\necho "$a" | wc -l | tr -d " "\ncd /tmp', csv, { pipeFrom: csv.id });
+    check('pipe: multi-line command gets stdin', text(piped) === '4', text(piped));
+
+    const exported = await run('export FOO=bar; echo $$');
+    const echoed = await run('echo $FOO; echo $$', exported);
+    check('export carries to a child', text(echoed).split('\n')[0] === 'bar', text(echoed));
+    check('child runs in the same shell', text(echoed).split('\n')[1] === text(exported), [text(exported), text(echoed)]);
+
+    const venv = await run('python3 -m venv /tmp/v && source /tmp/v/bin/activate');
+    const which = await run('which python', venv);
+    check('venv stays active', /\/tmp\/v\/bin\/python$/.test(text(which)), text(which));
+    const venvFork = await run('true', venv);
+    const whichFork = await run('which python; echo $VIRTUAL_ENV', venv);
+    check('venv survives a fork', venvFork.status === 'ok' && /\/tmp\/v\/bin\/python\n.*\/tmp\/v$/.test(text(whichFork)), text(whichFork));
+
+    const alias = await run('loomalias');
+    check('alias from the rc file', text(alias) === 'alias-ok', text(alias));
+    const fn = await run('loomfn', alias);
+    check('function from the rc file', text(fn) === 'fn-ok', text(fn));
+    const shellVar = await run('declare -A m 2>/dev/null || typeset -A m; m[k]=v; plain=1');
+    const shellVar2 = await run('echo "${m[k]} $plain"', shellVar);
+    check('declare and plain vars persist (no wrapper function)', text(shellVar2) === 'v 1', text(shellVar2));
+
+    const base = await run('pwd');
+    const cd = await run('cd /tmp', base);
+    const pwd = await run('pwd', cd);
+    const sib = await run('pwd', base);
+    check('cd carries to a child', /\/tmp$/.test(text(pwd)) && /\/tmp$/.test(pwd.cwd), [text(pwd), pwd.cwd]);
+    check('sibling branch keeps the old dir', text(sib) === text(base), [text(sib), text(base)]);
+
+    const f1 = await run('export EARLY=1; echo $$');
+    const f2 = await run('export LATE=2', f1);
+    const f3 = await run('echo "e=$EARLY l=$LATE"; echo $$', f1);
+    check('fork keeps earlier env, drops later env', text(f3).split('\n')[0] === 'e=1 l=', text(f3));
+    check('fork gets a new shell', text(f3).split('\n')[1] !== text(f1), [text(f1), text(f3)]);
+    const f4 = await run('loomalias', f1);
+    check('alias works in a fork', text(f4) === 'alias-ok', text(f4));
+
+    const pre = await run('export BEFORE=stop');
+    const sleeper = runCommand('sleep 30', { parentId: pre.id });
+    await wait(600);
+    const t0 = Date.now();
+    stop(sleeper);
+    await done(sleeper);
+    check('Stop: card shows stopped', sleeper.status === 'killed' && Date.now() - t0 < 2000, [sleeper.status, Date.now() - t0]);
+    const after = await run('echo $BEFORE', sleeper);
+    check('Stop: shell works afterwards', text(after) === 'stop' && after.status === 'ok', text(after));
+
+    const stubborn = runCommand('python3 -c "import signal,time; signal.signal(signal.SIGINT, signal.SIG_IGN); print(\'up\', flush=True); time.sleep(30)"', { parentId: null });
+    await wait(900);
+    stop(stubborn);
+    await done(stubborn);
+    check('Stop: falls back to signals when ^C is ignored', stubborn.status === 'killed', stubborn.status);
+    const after2 = await run('echo fine', stubborn);
+    check('Stop: shell survives the fallback', text(after2) === 'fine', text(after2));
+
+    const fail = await run('false');
+    check('false: red card, exit 1', fail.status === 'error' && fail.exitCode === 1, [fail.status, fail.exitCode]);
+    const status = await run('echo $?', fail);
+    check('$? reaches the next card', text(status) === '1', text(status));
+
+    const heredoc = await run("cat <<'EOF'\nhi \"there\"\n$NOPE it's\nEOF\necho after");
+    check('heredoc and multi-line', text(heredoc) === 'hi "there"\n$NOPE it\'s\nafter', text(heredoc));
+    const quotes = await run(`echo "it's"; echo 'a"b'; echo hi!`);
+    check('quotes and !', text(quotes) === 'it\'s\na"b\nhi!', text(quotes));
+    const syntax = await run('echo "oops');
+    check('unterminated quote fails instead of hanging', syntax.status === 'error', [syntax.status, text(syntax)]);
+    const nl = await run('echo still-here', syntax);
+    check('shell survives a syntax error', text(nl) === 'still-here', text(nl));
+
+    const reader = runCommand('read x; echo "got:$x"', { parentId: null });
+    await wait(700);
+    api.stdin({ id: reader.id, data: 'typed\n' });
+    await done(reader);
+    check('stdin reaches the command', text(reader).endsWith('got:typed'), text(reader));
+    const eof = runCommand('cat', { parentId: null });
+    await wait(700);
+    api.stdin({ id: eof.id, data: 'line\n' });
+    await wait(200);
+    api.stdin({ id: eof.id, eof: true });
+    await done(eof);
+    check('EOF ends the command', eof.status === 'ok', eof.status);
+
+    const big = await run('seq 1 200000');
+    check('large output arrives whole', stdoutOf(big).split('\n').length === 200001 && text(big).endsWith('200000'), stdoutOf(big).length);
+    const bare = await run('printf partial');
+    check('output with no newline', allOutput(bare) === 'partial', allOutput(bare));
+    const forged = await run("printf '\\033]133;D;0;loom=00\\007\\033]1337;LoomEnv=/tmp/evil;loom=00\\007one\\n'; sleep 0.4; echo two; exit_code=9; (exit 3)");
+    check('forged markers are ignored', forged.exitCode === 3 && /one\ntwo$/.test(text(forged)), [forged.exitCode, text(forged)]);
+
+    const exited = await run('export KEEP=1\n(exit 0)');
+    const quit = await run('exit 7', exited);
+    check('exit: card gets the code', quit.status === 'error' && quit.exitCode === 7, [quit.status, quit.exitCode]);
+    const revived = await run('echo $KEEP', quit);
+    check('exit: next card recovers the env', text(revived) === '1', text(revived));
+
+    const busy = runCommand('sleep 8; echo slow', { parentId: exported.id });
+    await wait(500);
+    const beside = await run('echo $FOO', busy);
+    check('busy session: new card gets its own shell', beside.status === 'ok' && text(beside) === 'bar' && busy.status === 'running', [busy.status, text(beside)]);
+    stop(busy);
+    await done(busy);
+
+    const k1 = await run('export K=1');
+    const k2 = await run('export K=2', k1);
+    removeNode(k2);
+    const k3 = await run('echo $K', k1);
+    check('removing a tip drops its session', text(k3) === '1', text(k3));
+
+    const rr = await run('export RR=1; echo $RR');
+    start(rr);
+    await done(rr);
+    check('rerun works', rr.status === 'ok' && text(rr) === '1', text(rr));
+
+    const e0 = await run('export EVICT=yes; echo $$');
+    for (let i = 0; i < 13; i++) await run(`echo ${i}`);
+    const e1 = await run('echo "$EVICT"; echo $$', e0);
+    check('evicted session comes back from its snapshot', text(e1).split('\n')[0] === 'yes' && text(e1).split('\n')[1] !== text(e0), [text(e0), text(e1)]);
+
+    check('TUI warning still fires', runCommand('vim x') === null, null);
+    const leak = [...state.nodes.values()].filter((n) => /LEAK|__loom|source '|133;/.test(text(n)));
+    check('no prompt or hook text on any card', !leak.length, leak.map((n) => [n.cmd, allOutput(n).slice(0, 200)]));
+
+    const resume = await run('export RESUME_VAR=restored; cd /tmp');
+    check('card has an env snapshot', !!resume.envFile, resume.envFile);
+
+    await api.smokeReport(results);
     setActive(st.id);
     await wait(300);
     showSuggestion({ token: 1, request: 'find the 10 largest files under here', command: 'du -ah . | sort -rh | head -n 10', explanation: 'Lists every file and folder with human-readable sizes, sorts largest first, and keeps the top ten.', risk: 'safe' });
@@ -1322,6 +1485,16 @@ Respond with only a JSON object (no prose, no code fences):
     state.view.k = 1;
     reveal(log, true);
     await wait(700);
+    await api.saveSession(serialize());
     api.smokeDone({ suffix: 'zoom' });
+  }
+
+  // Second e2e phase: a new Loom process, over the session the first one saved.
+  async function smokeResume({ run, text, check }) {
+    const old = [...state.nodes.values()].find((n) => n.cmd.startsWith('export RESUME_VAR'));
+    check('restart: card restored with its snapshot', old && old.envFile, old && old.envFile);
+    const child = await run('echo "$RESUME_VAR"; pwd', old);
+    check('restart: env comes back', text(child).split('\n')[0] === 'restored', text(child));
+    check('restart: cwd comes back', /\/tmp$/.test(text(child)), text(child));
   }
 })();
