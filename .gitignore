@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+
+# Secrets — never commit these
+.env
+.env.*
+!.env.example
+
+# Build / packaging output
+dist/
+out/
+release/
+*.dmg
+*.AppImage
+*.deb
+*.exe
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.log
+
+# Test screenshots from LOOM_SMOKE runs
+*.png
+!docs/**/*.png
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+*~
