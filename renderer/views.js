@@ -1,8 +1,8 @@
 'use strict';
-// Rich output views. `detect` decides whether a finished command has a
+// Rich output views. detect-worker.js decides whether a finished command has a
 // better-than-text representation; `render` builds the DOM for it.
 (function (g) {
-  const { strip, escapeHtml: esc } = g.Ansi;
+  const { escapeHtml: esc } = g.Ansi;
 
   // ------------------------------------------------------------ helpers
   function el(tag, cls, text) {
@@ -13,32 +13,6 @@
   }
 
   const shq = (s) => (/^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`);
-
-  // Splits a command into words. `simple` is false when it contains shell
-  // control characters outside quotes (pipes, redirects, substitutions…).
-  function tokenize(cmd) {
-    const tokens = [];
-    let cur = '';
-    let has = false;
-    let q = null;
-    let simple = true;
-    for (let i = 0; i < cmd.length; i++) {
-      const c = cmd[i];
-      if (q) {
-        if (c === q) q = null;
-        else if (c === '\\' && q === '"' && i + 1 < cmd.length) cur += cmd[++i];
-        else cur += c;
-        continue;
-      }
-      if (c === '"' || c === "'") { q = c; has = true; continue; }
-      if (c === '\\' && i + 1 < cmd.length) { cur += cmd[++i]; has = true; continue; }
-      if (/\s/.test(c)) { if (has) { tokens.push(cur); cur = ''; has = false; } continue; }
-      if ('|;&<>`$(){}*?'.includes(c)) simple = false;
-      cur += c; has = true;
-    }
-    if (has) tokens.push(cur);
-    return { tokens, simple: simple && !q };
-  }
 
   function fmtSize(n) {
     if (n < 1024) return `${n} B`;
@@ -81,127 +55,30 @@
     return { kind: EXT_KIND[ext] || (/(lock|rc|config)$/.test(e.name) ? 'config' : 'other'), badge: ext.slice(0, 4).toUpperCase() || '—', ext };
   }
 
-  // ------------------------------------------------------------ parsers
-  function parseDelimited(text, d) {
-    const rows = [];
-    let row = [];
-    let cell = '';
-    let q = false;
-    for (let i = 0; i < text.length; i++) {
-      const c = text[i];
-      if (q) {
-        if (c === '"' && text[i + 1] === '"') { cell += '"'; i++; }
-        else if (c === '"') q = false;
-        else cell += c;
-      } else if (c === '"' && cell === '') q = true;
-      else if (c === d) { row.push(cell); cell = ''; }
-      else if (c === '\n' || c === '\r') {
-        if (c === '\r' && text[i + 1] === '\n') i++;
-        row.push(cell); rows.push(row); row = []; cell = '';
-        if (rows.length > 5000) break;
-      } else cell += c;
-    }
-    if (cell || row.length) { row.push(cell); rows.push(row); }
-    return rows.filter((r) => !(r.length === 1 && r[0] === ''));
-  }
-
-  function detectDelimited(text, cmd) {
-    const hint = /\.(csv|tsv)\b/i.test(cmd);
-    for (const d of ['\t', ',']) {
-      if (!text.includes(d)) continue;
-      const rows = parseDelimited(text, d);
-      if (rows.length < 2) continue;
-      const w = rows[0].length;
-      const sample = rows.slice(0, 60);
-      const consistent = sample.every((r) => r.length === w);
-      if (!consistent || w < 2) continue;
-      if (d === ',' && !hint && (w < 3 || rows.length < 3)) continue;
-      return { headers: rows[0], rows: rows.slice(1) };
-    }
-    return null;
-  }
-
-  // Whitespace-aligned tables (ps, df, docker ps, kubectl get…): find
-  // character columns that are blank on every line and split there.
-  const COLUMN_CMDS = new Set(['ps', 'df', 'docker', 'podman', 'kubectl', 'lsof', 'netstat', 'free', 'launchctl', 'who', 'w', 'jobs', 'ss', 'brew', 'pip', 'pip3', 'helm', 'gcloud', 'aws']);
-  function detectColumns(text, cmd) {
-    const lines = text.split('\n').filter((l) => l.trim());
-    if (lines.length < 2 || lines.length > 5000) return null;
-    const head = lines[0];
-    const first = cmd.trim().split(/\s+/)[0];
-    const letters = head.replace(/[^A-Za-z]/g, '');
-    const caps = letters && letters.replace(/[^A-Z]/g, '').length / letters.length > 0.7;
-    if (!COLUMN_CMDS.has(first) && !caps) return null;
-    if (!/^[\sA-Z%#]/.test(head) || /[.!?]$/.test(head.trim())) return null;
-    const sample = lines.slice(0, 200);
-    const gap = [];
-    for (let i = 0; i < head.length; i++) gap[i] = sample.every((l) => i >= l.length || l[i] === ' ');
-    // column starts = header positions where a non-gap run begins after a gap run
-    const starts = [];
-    for (let i = 0; i < head.length; i++) if (!gap[i] && (i === 0 || gap[i - 1])) starts.push(i);
-    if (starts.length < 3) return null;
-    const cut = (l) => starts.map((s, j) => l.slice(s, j + 1 < starts.length ? starts[j + 1] : undefined).trim());
-    const headers = cut(head);
-    if (headers.some((h) => !h)) return null;
-    return { headers, rows: lines.slice(1).map(cut) };
-  }
-
-  // ------------------------------------------------------------ detection
-  const NO_RICH_LOG = /^(-p|--patch|--stat|--shortstat|--numstat|--name-only|--name-status|-L.*|--follow|--graph)$/;
-  const DROP_LOG = /^(--oneline|--decorate.*|--color.*|--no-color|--pretty=.*|--format=.*|--abbrev-commit|--no-decorate|--date=.*)$/;
-
-  async function detect(node, api, stdout) {
-    if (node.status !== 'ok') return null;
-    const cmd = node.cmd.trim();
-
-    // `ls`, optionally after `cd somewhere &&`
-    let lsCmd = cmd;
-    let base = node.cwd;
-    const cd = cmd.match(/^cd\s+(.+?)\s*&&\s*(ls(?:\s.*)?)$/);
-    if (cd) { lsCmd = cd[2]; base = node.cwdAfter || node.cwd; }
-    const lt = tokenize(lsCmd);
-    if (lt.simple && lt.tokens[0] === 'ls') {
-      const args = lt.tokens.slice(1);
-      const flags = args.filter((a) => a.startsWith('-')).join('');
-      const targets = args.filter((a) => !a.startsWith('-'));
-      if (targets.length <= 1 && !/R|d/.test(flags)) {
-        const res = await api.listDir({ cwd: base, target: targets[0] || '.', hidden: /a|A/.test(flags) });
-        if (res) return { kind: 'files', data: res };
-      }
-    }
-
-    const t = tokenize(cmd);
-    if (t.simple && t.tokens[0] === 'git') {
-      const sub = t.tokens[1];
-      const rest = t.tokens.slice(2);
-      if (sub === 'log' && !rest.some((a) => NO_RICH_LOG.test(a)) && !rest.includes('--')) {
-        const res = await api.gitLog({ cwd: node.cwd, args: rest.filter((a) => !DROP_LOG.test(a)) });
-        if (res && res.commits.length) {
-          res.commits = res.commits.slice(0, 400);
-          return { kind: 'gitlog', data: res };
-        }
-      }
-      if (sub === 'status' && rest.every((a) => /^-(s|b|sb|-short|-branch)$/.test(a))) {
-        const res = await api.gitStatus({ cwd: node.cwd });
-        if (res) return { kind: 'gitstatus', data: res };
-      }
-    }
-
-    const text = strip(stdout).trim();
-    if (!text || text.length > 4 * 1024 * 1024) return null;
-
-    if (/^[[{]/.test(text)) {
-      try { return { kind: 'json', data: JSON.parse(text) }; } catch { /* maybe NDJSON */ }
-      const lines = text.split('\n').filter((l) => l.trim());
-      if (lines.length >= 2 && lines.length <= 20000) {
-        try { return { kind: 'json', data: lines.map((l) => JSON.parse(l)) }; } catch { /* not JSON */ }
-      }
-    }
-    const delim = detectDelimited(text, cmd);
-    if (delim) return { kind: 'table', data: delim };
-    const cols = detectColumns(text, cmd);
-    if (cols) return { kind: 'table', data: cols };
-    return null;
+  // ------------------------------------------------------------ worker
+  // Detection and parsing run in detect-worker.js, which gets output from main
+  // over its own port. Parsed JSON and tables stay there; views ask for parts.
+  function connect(api) {
+    const w = new Worker('detect-worker.js');
+    let rid = 0;
+    const waiting = new Map();
+    w.onmessage = (e) => {
+      const { rid: id, ok, value, error } = e.data;
+      const p = waiting.get(id);
+      if (!p) return;
+      waiting.delete(id);
+      if (ok) p.resolve(value); else p.reject(new Error(error));
+    };
+    window.addEventListener('message', (e) => {
+      if (e.data === 'loom-worker-port' && e.ports && e.ports[0]) w.postMessage({ port: e.ports[0] }, [e.ports[0]]);
+    });
+    api.workerPort();
+    const call = (op, arg) => new Promise((resolve, reject) => {
+      const id = ++rid;
+      waiting.set(id, { resolve, reject });
+      w.postMessage({ rid: id, op, arg });
+    });
+    return { call };
   }
 
   // ------------------------------------------------------------ renderers
@@ -251,93 +128,104 @@
     return root;
   }
 
-  function renderJson(value) {
+  // The parsed document stays in the worker. Each node asks for its children
+  // when it's opened.
+  function renderJson(data, ctx) {
     const root = el('div', 'rv-json');
     const keyHtml = (k) => (k === null ? '' : `<span class="jk">${typeof k === 'number' ? k : esc(JSON.stringify(k))}</span><span class="jp">: </span>`);
     const valHtml = (v) => {
-      if (v === null) return '<span class="jnull">null</span>';
-      if (typeof v === 'string') {
-        const s = v.length > 2000 ? `${v.slice(0, 2000)}…` : v;
-        return `<span class="jstr">${esc(JSON.stringify(s))}</span>`;
-      }
-      if (typeof v === 'number') return `<span class="jnum">${v}</span>`;
-      return `<span class="jbool">${v}</span>`;
+      if (v.t === 'z') return '<span class="jnull">null</span>';
+      if (v.t === 's') return `<span class="jstr">${esc(JSON.stringify(v.v))}</span>`;
+      if (v.t === 'n') return `<span class="jnum">${v.v}</span>`;
+      return `<span class="jbool">${v.v}</span>`;
     };
-    function node(key, val, depth) {
+    function node(key, sum, path, depth) {
       const row = el('div', 'jn');
-      if (val && typeof val === 'object') {
-        const arr = Array.isArray(val);
-        const keys = arr ? val.map((_, i) => i) : Object.keys(val);
-        const d = el('details');
-        const s = el('summary');
-        s.innerHTML = `${keyHtml(key)}<span class="jp">${arr ? '[' : '{'}</span><span class="jcount">${keys.length} ${arr ? (keys.length === 1 ? 'item' : 'items') : (keys.length === 1 ? 'key' : 'keys')}</span><span class="jp">${arr ? ']' : '}'}</span>`;
-        const body = el('div', 'jchildren');
-        d.append(s, body);
-        const fill = () => {
-          if (body.dataset.filled) return;
-          body.dataset.filled = '1';
-          keys.slice(0, 500).forEach((k) => body.append(node(k, val[k], depth + 1)));
-          if (keys.length > 500) body.append(el('div', 'jmore', `… ${keys.length - 500} more`));
-        };
-        d.addEventListener('toggle', () => d.open && fill());
-        if (depth < 2 && keys.length <= 200) { d.open = true; fill(); }
-        row.append(d);
-      } else {
-        row.innerHTML = keyHtml(key) + valHtml(val);
-      }
+      if (sum.t !== 'o' && sum.t !== 'a') { row.innerHTML = keyHtml(key) + valHtml(sum); return row; }
+      const arr = sum.t === 'a';
+      const d = el('details');
+      const s = el('summary');
+      s.innerHTML = `${keyHtml(key)}<span class="jp">${arr ? '[' : '{'}</span><span class="jcount">${sum.n} ${arr ? (sum.n === 1 ? 'item' : 'items') : (sum.n === 1 ? 'key' : 'keys')}</span><span class="jp">${arr ? ']' : '}'}</span>`;
+      const body = el('div', 'jchildren');
+      d.append(s, body);
+      let filled = false;
+      const fill = async () => {
+        if (filled) return;
+        filled = true;
+        const res = await ctx.worker.call('children', { doc: data.doc, path });
+        if (!res) { body.append(el('div', 'jmore', 'Reopen the card to load this')); return; }
+        const frag = document.createDocumentFragment();
+        for (const c of res.entries) frag.append(node(c.k, c, [...path, c.k], depth + 1));
+        if (res.more) frag.append(el('div', 'jmore', `… ${res.more.toLocaleString()} more`));
+        body.append(frag);
+      };
+      d.addEventListener('toggle', () => d.open && fill());
+      if (depth < 2 && sum.n <= 200) { d.open = true; fill(); }
+      row.append(d);
       return row;
     }
-    root.append(node(null, value, 0));
+    root.append(node(null, data.root, [], 0));
+    if (data.more) root.append(el('div', 'rv-foot', 'Parsed from the first 4 MB of output'));
     return root;
   }
 
-  function renderTable(data) {
+  // Rows come from the worker, sorted there, and only the visible ones are in
+  // the DOM. The card body is the scroller.
+  function renderTable(data, ctx) {
+    const ROW = 25;
+    const OVER = 20;
     const root = el('div', 'rv-table-wrap');
     const table = el('table', 'rv-table');
     const thead = el('thead');
     const tr = el('tr');
     const tbody = el('tbody');
+    const top = el('tr', 'rv-spacer');
+    const bottom = el('tr', 'rv-spacer');
     let sortCol = -1;
     let dir = 1;
-    const num = (s) => {
-      const m = String(s).trim().match(/^-?[\d,.]+(?:\s*([KMGTP])i?B?)?%?$/i);
-      if (!m) return null;
-      const n = parseFloat(String(s).replace(/,/g, ''));
-      const mult = { K: 1e3, M: 1e6, G: 1e9, T: 1e12, P: 1e15 }[(m[1] || '').toUpperCase()] || 1;
-      return Number.isFinite(n) ? n * mult : null;
-    };
-    const draw = () => {
-      let rows = data.rows;
-      if (sortCol >= 0) {
-        rows = [...rows].sort((a, b) => {
-          const x = a[sortCol] ?? ''; const y = b[sortCol] ?? '';
-          const nx = num(x); const ny = num(y);
-          if (nx != null && ny != null) return (nx - ny) * dir;
-          return String(x).localeCompare(String(y), undefined, { numeric: true }) * dir;
-        });
-      }
-      tbody.textContent = '';
-      for (const r of rows.slice(0, 1500)) {
-        const row = el('tr');
-        data.headers.forEach((_, i) => {
-          const td = el('td', null, r[i] ?? '');
-          if (num(r[i] ?? '') != null) td.className = 'n';
-          row.append(td);
-        });
-        tbody.append(row);
-      }
-      [...tr.children].forEach((th, i) => { th.dataset.sort = i === sortCol ? (dir > 0 ? '↑' : '↓') : ''; });
-    };
+    let shown = [-1, -1];
+    let seq = 0;
+    let queued = false;
+    const total = data.total;
     data.headers.forEach((h, i) => {
       const th = el('th', null, h);
-      th.addEventListener('click', () => { if (sortCol === i) dir = -dir; else { sortCol = i; dir = 1; } draw(); });
+      th.style.width = `${data.widths[i] + 2}ch`;
+      th.addEventListener('click', () => { if (sortCol === i) dir = -dir; else { sortCol = i; dir = 1; } shown = [-1, -1]; mark(); draw(); });
       tr.append(th);
     });
+    const mark = () => [...tr.children].forEach((th, i) => { th.dataset.sort = i === sortCol ? (dir > 0 ? '↑' : '↓') : ''; });
     thead.append(tr);
+    tbody.append(top, bottom);
     table.append(thead, tbody);
     root.append(table);
-    if (data.rows.length > 1500) root.append(el('div', 'rv-foot', `Showing 1,500 of ${data.rows.length.toLocaleString()} rows`));
-    draw();
+    if (data.more) root.append(el('div', 'rv-foot', `${total.toLocaleString()} rows from the first 4 MB of output`));
+
+    async function draw() {
+      queued = false;
+      const sc = ctx.scroller();
+      if (!sc) return;
+      const offset = thead.offsetHeight; // the table starts the card body
+      const first = Math.max(0, Math.floor((sc.scrollTop - offset) / ROW) - OVER);
+      const count = Math.ceil(sc.clientHeight / ROW) + OVER * 2;
+      const last = Math.min(total, first + count);
+      if (first === shown[0] && last === shown[1]) return;
+      const mine = ++seq;
+      const res = await ctx.worker.call('rows', { doc: data.doc, sort: sortCol, dir, from: first, count: last - first });
+      if (mine !== seq || !res) return;
+      shown = [first, last];
+      const frag = document.createDocumentFragment();
+      for (const r of res.rows) {
+        const row = el('tr');
+        data.headers.forEach((_, i) => row.append(el('td', data.numeric[i] ? 'n' : null, r[i] ?? '')));
+        frag.append(row);
+      }
+      while (top.nextSibling !== bottom) top.nextSibling.remove();
+      tbody.insertBefore(frag, bottom);
+      top.style.height = `${first * ROW}px`;
+      bottom.style.height = `${(total - last) * ROW}px`;
+    }
+    root.addEventListener('loom-scroll', () => { if (!queued) { queued = true; requestAnimationFrame(draw); } });
+    requestAnimationFrame(draw);
     return root;
   }
 
@@ -460,8 +348,8 @@
   function render(rich, ctx) {
     switch (rich.kind) {
       case 'files': return renderFiles(rich.data, ctx);
-      case 'json': return renderJson(rich.data);
-      case 'table': return renderTable(rich.data);
+      case 'json': return renderJson(rich.data, ctx);
+      case 'table': return renderTable(rich.data, ctx);
       case 'gitlog': return renderGitLog(rich.data, ctx);
       case 'gitstatus': return renderGitStatus(rich.data, ctx);
       default: return el('div', null, '');
@@ -470,5 +358,5 @@
 
   const LABELS = { files: 'Files', json: 'JSON', table: 'Table', gitlog: 'Graph', gitstatus: 'Status' };
 
-  g.Views = { detect, render, tokenize, shq, LABELS, fmtSize };
+  g.Views = { connect, render, shq, LABELS, fmtSize };
 })(window);

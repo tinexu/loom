@@ -1,7 +1,11 @@
 'use strict';
 // Minimal ANSI → HTML: SGR colors/styles, carriage-return overwrites,
-// backspaces; every other escape sequence is dropped.
-(function (g) {
+// backspaces; every other escape sequence is dropped. Loaded by the page and
+// the rich-view worker as Ansi, and by the tests with require().
+(function (root, factory) {
+  if (typeof module === 'object' && module.exports) module.exports = factory(root);
+  else root.Ansi = factory(root);
+}(typeof self !== 'undefined' ? self : this, (g) => {
   const DARK = [
     '#3d434d', '#f07178', '#a3d983', '#e8c278', '#7aa8f5', '#c792ea', '#6cd0d0', '#c9ced6',
     '#69707c', '#ff8f96', '#bdeb9f', '#f5d491', '#9cc0ff', '#dcabff', '#8ee6e6', '#f2f4f7',
@@ -11,7 +15,7 @@
     '#1b1f25', '#c4323b', '#237a3e', '#8a6100', '#2a5fc9', '#8a3fb5', '#14787d', '#5d6573',
     '#4a515c', '#b8323b', '#1f6b37', '#7a5600', '#2353b0', '#7a35a3', '#106a6f', '#3f4650',
   ];
-  const lightTheme = window.matchMedia('(prefers-color-scheme: light)');
+  const lightTheme = g && g.matchMedia ? g.matchMedia('(prefers-color-scheme: light)') : { matches: false, addEventListener() {} };
   const palette = () => (lightTheme.matches ? LIGHT : DARK);
   const RE = /\x1b\[([0-9;?]*)([ -\/]*[@-~])|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|\x1b[=>78DEHMc]/g;
 
@@ -84,9 +88,9 @@
     return css;
   }
 
-  function toHtml(text) {
+  // `st` carries SGR state in and out, so consecutive lines keep their colors.
+  function toHtml(text, st = {}) {
     text = normalize(text);
-    const st = {};
     let out = '';
     let last = 0;
     let m;
@@ -105,5 +109,5 @@
     return out;
   }
 
-  g.Ansi = { toHtml, strip, escapeHtml, normalize, palette, lightTheme };
-})(window);
+  return { toHtml, strip, escapeHtml, normalize, palette, lightTheme, applySGR, styleOf, RE };
+}));

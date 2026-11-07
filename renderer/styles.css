@@ -163,12 +163,13 @@ body.with-sidebar #btn-map { color: var(--text); background: var(--hover); }
   background: var(--card-2); border: 1px solid var(--line); outline: none;
 }
 #map-search:focus { border-color: var(--line-2); }
-#map-tree { flex: 1; overflow: auto; padding: 6px 0; }
+#map-tree { flex: 1; overflow: auto; position: relative; }
+#map-rows { position: relative; margin: 6px 0; }
 .tr-row {
   --depth: 0;
   display: grid; grid-template-columns: 10px 1fr auto; align-items: center; gap: 9px;
-  width: 100%; text-align: left; padding: 4px 12px 4px calc(14px + var(--depth) * 16px);
-  position: relative;
+  width: 100%; height: 26px; text-align: left; padding: 0 12px 0 calc(14px + var(--depth) * 16px);
+  position: absolute; left: 0; top: 0;
 }
 .tr-row::before {
   content: ""; position: absolute; top: 0; bottom: 0;
@@ -274,6 +275,7 @@ body.with-sidebar #viewport { left: 290px; }
 }
 .card-body.raw { padding: 10px 16px 12px; }
 .card-body pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
+.card-body.snap { content-visibility: auto; }
 .card-body .stderr { color: var(--err-text); }
 .card.collapsed .card-sub, .card.collapsed .card-body, .card.collapsed .card-ai, .card.collapsed .card-resize { display: none; }
 .card.collapsed .card-head { padding-bottom: 10px; }
@@ -284,8 +286,45 @@ body.with-sidebar #viewport { left: 290px; }
 .placeholder.running span:nth-child(3), .sg-loading span:nth-child(3) { animation-delay: 0.3s; }
 @keyframes blink { 0%, 100% { opacity: 0.25; } 50% { opacity: 1; } }
 .show-all { display: block; width: 100%; margin-bottom: 8px; padding: 5px; border-radius: 6px; background: var(--card-2); color: var(--muted); font-family: var(--ui); font-size: 11.5px; }
-#viewport.far .card-body { opacity: 0.55; }
-#viewport.far .card-cmd { font-size: 18px; }
+/* ---- level of detail: empty boxes off screen, pills when zoomed out, one canvas further out */
+.card.stub { box-shadow: none; transition: none; }
+.card.stub, .card.pill { contain: strict; }
+#viewport.lod-far #world { visibility: hidden; }
+#viewport.lod-far #live-layer { display: none; }
+#far { position: absolute; inset: 0; width: 100%; height: 100%; }
+.card.pill { box-shadow: none; transition: none; overflow: hidden; }
+.pill-head { display: flex; align-items: center; gap: 14px; padding: 18px 22px; min-width: 0; cursor: grab; }
+.pill-head .status-dot { width: 20px; height: 20px; }
+.pill-head .card-id { font-size: 18px; }
+.pill-head .card-cmd { font-size: 26px; flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pill-head .card-meta { font-size: 20px; }
+.card.pill::after { content: ""; position: absolute; left: 22px; right: 22px; top: 74px; bottom: 18px; border-radius: 8px; background: var(--card-2); }
+.card.pill.collapsed::after { display: none; }
+
+/* ---- a finished card's output, virtualized (renderer/vlines.js) */
+.char-probe { position: absolute; visibility: hidden; white-space: pre; font: 12.5px var(--mono); }
+.card-body.vtbody { overflow: hidden; padding-right: 6px; }
+.vt { position: relative; outline: none; }
+.vt-view { position: relative; overflow: hidden; margin-right: 10px; }
+.vt-rows { position: absolute; left: 0; right: 0; top: 0; will-change: transform; }
+.vt-row { position: absolute; left: 0; height: 19px; line-height: 19px; white-space: pre; font: 12.5px/19px var(--mono); }
+.vt-hit { background: color-mix(in srgb, var(--warn) 35%, transparent); color: inherit; border-radius: 2px; }
+.vt-hit.cur { background: var(--warn); color: var(--accent-ink); }
+.vt-bar { position: absolute; top: 0; right: 0; bottom: 0; width: 8px; border-radius: 8px; cursor: default; }
+.vt-thumb { width: 100%; background: var(--line-2); border-radius: 8px; }
+.vt-bar:hover .vt-thumb { background: var(--faint); }
+.vt-find { display: flex; align-items: center; gap: 4px; margin: 0 10px 8px 0; padding: 3px 4px 3px 8px; border-radius: 8px; background: var(--card-2); border: 1px solid var(--line-2); font-family: var(--ui); }
+.vt-q { flex: 1; min-width: 0; background: transparent; border: 0; outline: none; font: 12px var(--mono); user-select: text; }
+.vt-count { color: var(--muted); font-size: 11.5px; font-variant-numeric: tabular-nums; white-space: nowrap; padding: 0 4px; }
+.vt-find button { width: 22px; height: 22px; border-radius: 5px; color: var(--muted); }
+.vt-find button:hover { background: var(--hover); color: var(--text); }
+.card-note { padding: 6px 16px; border-top: 1px solid var(--line); background: color-mix(in srgb, var(--warn) 12%, transparent); color: var(--text); font-size: 12px; }
+.card-note .linkish { font-size: 12px; margin-left: 4px; }
+.rv-spacer { height: 0; }
+.rv-spacer td { padding: 0; border: 0; }
+.rv-table { table-layout: fixed; }
+.rv-table tbody tr:not(.rv-spacer) { height: 25px; }
+.row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 
 .card-ai {
   position: relative; border-top: 1px solid var(--line);

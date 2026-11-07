@@ -7,8 +7,9 @@
   "scripts": {
     "start": "electron .",
     "postinstall": "electron-rebuild -f -w node-pty && node scripts/vendor.js",
-    "test": "node --test test/parser.test.js test/shell-lex.test.js test/history.test.js test/complete.test.js",
-    "e2e": "node test/e2e.js"
+    "test": "node --test test/parser.test.js test/shell-lex.test.js test/history.test.js test/complete.test.js test/outputs.test.js test/wrap.test.js test/spatial.test.js",
+    "e2e": "node test/e2e.js",
+    "bench": "node scripts/bench.js"
   },
   "license": "MIT",
   "devDependencies": {

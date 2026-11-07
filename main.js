@@ -3,8 +3,10 @@
 // Routes commands to long-lived shell sessions (lib/sessions.js), or to one
 // child process per card where those aren't available, and brokers file-system,
 // git and Claude calls for the renderer. The renderer never touches Node directly.
+// Every card's output is recorded here (lib/outputs.js); the renderer asks for
+// the lines it shows, and only watched running cards stream to it (lib/relay.js).
 
-const { app, BrowserWindow, ipcMain, safeStorage, shell, nativeTheme, clipboard } = require('electron');
+const { app, BrowserWindow, ipcMain, safeStorage, shell, nativeTheme, clipboard, dialog, MessageChannelMain } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -13,17 +15,23 @@ const { StringDecoder } = require('string_decoder');
 const { createSessions } = require('./lib/sessions');
 const { createShellInfo } = require('./lib/shellinfo');
 const { createHistory, parseZshHistory, parseBashHistory } = require('./lib/history');
+const { createOutputs } = require('./lib/outputs');
+const { createRelay } = require('./lib/relay');
 const completer = require('./lib/complete');
 
 const isWin = process.platform === 'win32';
 const SMOKE = process.env.LOOM_SMOKE || '';
-const MAX_OUTPUT = 5 * 1024 * 1024; // per command
+const BENCH = SMOKE ? process.env.LOOM_BENCH || '' : '';
+const PROC_START = Date.now() - process.uptime() * 1000;
+const GB = 1024 ** 3;
+const COPY_MAX = 32 * 1024 * 1024;
 const DEFAULT_MODEL = 'claude-sonnet-5-5';
 
 if (SMOKE) {
   // A fixed LOOM_SMOKE_USERDATA lets the e2e run restart Loom over its own session.
   app.setPath('userData', process.env.LOOM_SMOKE_USERDATA || path.join(os.tmpdir(), `loom-smoke-${process.pid}`));
-  app.disableHardwareAcceleration();
+  // The bench measures frame rates, so it keeps the GPU.
+  if (!BENCH) app.disableHardwareAcceleration();
 }
 
 let win = null;
@@ -31,6 +39,8 @@ let loginPath = process.env.PATH || '';
 let sessions = null;
 let shellInfo = null;
 let history = null;
+let outputs = null;
+let relay = null;
 const procs = new Map();
 
 // ---------------------------------------------------------------- storage
@@ -145,15 +155,65 @@ function startSessions() {
       }
       return env;
     },
-    onData: (id, chunks) => send('cmd:data', { id, chunks }),
-    onExit: (msg) => send('cmd:exit', msg),
+    onOutput: cardOutput,
+    onExit: cardExit,
     fallback: runSpawned,
   });
 }
 
-ipcMain.handle('cmd:run', (_e, req) => (sessions ? sessions.run(req) : runSpawned(req)));
+// ---------------------------------------------------------------- output
+const capsFromSettings = () => {
+  const s = settings();
+  return { card: (Number(s.outputCapGB) || 1) * GB, total: (Number(s.outputTotalGB) || 5) * GB };
+};
 
-function runSpawned({ id, command, cwd, stdin }) {
+function startOutputs() {
+  outputs = createOutputs({
+    dir: file('outputs'),
+    ...(() => { const c = capsFromSettings(); return { capCard: c.card, capTotal: c.total }; })(),
+    onCapped: (id, cap) => send('out:capped', { id, cap }),
+    onEvicted: (id) => send('out:evicted', { id }),
+  });
+  relay = createRelay({
+    send: (id, data) => send('cmd:data', { id, data }),
+    pause: (id, on) => {
+      if (sessions && sessions.owns(id)) { sessions.pause(id, on); return; }
+      const p = procs.get(id);
+      if (!p) return;
+      for (const st of [p.child.stdout, p.child.stderr]) { if (on) st.pause(); else st.resume(); }
+    },
+    plain: (id) => !outputs.state(id).moved,
+  });
+}
+
+// Every byte is recorded; the renderer gets it only if it's watching the card.
+function cardOutput(id, text) {
+  outputs.append(id, text);
+  relay.data(id, text);
+}
+
+// What's left for the renderer goes first, then the exit with the output's shape.
+function cardExit(msg) {
+  relay.end(msg.id);
+  const out = outputs.end(msg.id);
+  send('cmd:exit', { ...msg, out });
+}
+
+const tmpFile = (name) => path.join(os.tmpdir(), `loom-${process.pid}-${name}`);
+
+ipcMain.handle('cmd:run', async (_e, req) => {
+  outputs.begin(req.id);
+  relay.start(req.id, { watch: req.watch !== false });
+  // A card-to-card pipe: the source's visible text, streamed to a file.
+  if (req.stdinFrom != null) {
+    const dest = tmpFile(`stdin-${req.id}-${Date.now()}`);
+    await outputs.exportPlain(req.stdinFrom, dest);
+    req.stdinPath = dest;
+  }
+  return sessions ? sessions.run(req) : runSpawned(req);
+});
+
+function runSpawned({ id, command, cwd, stdin, stdinPath }) {
   const dir = cwd && isDir(cwd) ? cwd : os.homedir();
   const env = cmdEnv();
   let child;
@@ -166,10 +226,10 @@ function runSpawned({ id, command, cwd, stdin }) {
     if (m) {
       const target = path.resolve(dir, expandHome((m[1] || '~').replace(/^["']|["']$/g, '')));
       setImmediate(() => {
-        if (isDir(target)) send('cmd:exit', { id, code: 0, signal: null, cwd: target });
+        if (isDir(target)) cardExit({ id, code: 0, signal: null, cwd: target });
         else {
-          send('cmd:data', { id, chunks: [[1, `cd: no such directory: ${target}\n`]] });
-          send('cmd:exit', { id, code: 1, signal: null, cwd: dir });
+          cardOutput(id, `cd: no such directory: ${target}\r\n`);
+          cardExit({ id, code: 1, signal: null, cwd: dir });
         }
       });
       return { pid: null };
@@ -186,48 +246,38 @@ function runSpawned({ id, command, cwd, stdin }) {
     child.stdio[3].on('error', () => {});
   }
 
-  const p = { child, buf: [], timer: null, bytes: 0, truncated: false };
+  const p = { child };
   procs.set(id, p);
 
-  const flush = () => {
-    clearTimeout(p.timer);
-    p.timer = null;
-    if (p.buf.length) { send('cmd:data', { id, chunks: p.buf }); p.buf = []; }
-  };
-  const push = (stream) => {
+  const push = () => {
     const decoder = new StringDecoder('utf8');
     return (data) => {
-      if (p.truncated) return;
-      p.bytes += data.length;
-      let text = decoder.write(data);
-      if (p.bytes > MAX_OUTPUT) {
-        p.truncated = true;
-        stream = 1;
-        text = `\n[loom: output truncated after ${MAX_OUTPUT / 1048576} MB]\n`;
-      }
-      const last = p.buf[p.buf.length - 1];
-      text = text.replace(/\r?\n/g, '\r\n'); // the renderer's terminal model expects a TTY's line endings
-      if (last && last[0] === stream) last[1] += text; else p.buf.push([stream, text]);
-      if (!p.timer) p.timer = setTimeout(flush, 24);
+      // The renderer's terminal model expects a TTY's line endings.
+      const text = decoder.write(data).replace(/\r?\n/g, '\r\n');
+      if (text) cardOutput(id, text);
     };
   };
 
-  child.stdout.on('data', push(0));
-  child.stderr.on('data', push(1));
+  child.stdout.on('data', push());
+  child.stderr.on('data', push());
   child.stdin.on('error', () => {});
-  if (typeof stdin === 'string') child.stdin.end(stdin);
+  if (stdinPath) {
+    const rs = fs.createReadStream(stdinPath);
+    rs.on('error', () => child.stdin.end());
+    rs.on('close', () => fs.rm(stdinPath, { force: true }, () => {}));
+    rs.pipe(child.stdin);
+  } else if (typeof stdin === 'string') child.stdin.end(stdin);
 
   let done = false;
   const finish = (code, signal) => {
     if (done) return;
     done = true;
-    flush();
     procs.delete(id);
     const finalCwd = cwdOut && isDir(cwdOut) ? cwdOut : dir;
-    send('cmd:exit', { id, code, signal, cwd: finalCwd, truncated: p.truncated });
+    cardExit({ id, code, signal, cwd: finalCwd });
   };
   child.on('error', (err) => {
-    p.buf.push([1, `loom: ${err.message}\n`]);
+    cardOutput(id, `loom: ${err.message}\r\n`);
     finish(127, null);
   });
   child.on('close', (code, signal) => finish(code, signal));
@@ -262,8 +312,64 @@ ipcMain.handle('cmd:stdin', (_e, { id, data, eof }) => {
 });
 
 ipcMain.handle('cmd:resize', (_e, { id, cols, rows }) => { if (sessions) sessions.resize(id, cols, rows); });
-ipcMain.handle('cmd:ack', (_e, { id, bytes }) => { if (sessions) sessions.ack(id, bytes); });
-ipcMain.handle('cmd:forget', (_e, id) => { if (sessions) sessions.forget(id); });
+ipcMain.on('cmd:ack', (_e, { id, bytes }) => relay.ack(id, bytes));
+ipcMain.handle('cmd:forget', (_e, id) => {
+  if (sessions) sessions.forget(id);
+  outputs.remove(id);
+  if (session) session.nodes.delete(id);
+});
+
+// The renderer starts or stops watching a running card. Starting returns what
+// its new terminal model needs to show the screen as it is.
+ipcMain.handle('out:subscribe', (_e, { id, on }) => {
+  if (!relay.subscribe(id, on)) return null;
+  return on ? { replay: outputs.replay(id) } : {};
+});
+ipcMain.handle('out:replay', async (_e, { id, full }) => { await outputs.load(id); return { replay: outputs.replay(id, { full }) }; });
+ipcMain.handle('out:info', (_e, id) => outputs.info(id));
+ipcMain.handle('out:view', (_e, req) => outputs.view(req.id, req));
+ipcMain.handle('out:range', (_e, req) => outputs.range(req.id, req));
+ipcMain.handle('out:locate', (_e, req) => outputs.locate(req.id, req));
+ipcMain.handle('out:head', (_e, req) => outputs.head(req.id, req));
+ipcMain.handle('out:clip', (_e, req) => outputs.clip(req.id, req));
+ipcMain.handle('out:search', async (_e, req) => {
+  const res = await outputs.search(req.id, { query: String(req.query || ''), caseSensitive: !!req.caseSensitive });
+  return res && { ...res, lines: Array.from(res.lines) };
+});
+// The screen text of a card whose program moved the cursor, from its terminal.
+ipcMain.handle('out:replace', (_e, { id, text }) => outputs.put(id, String(text)));
+
+ipcMain.handle('clip:write', (_e, text) => { clipboard.writeText(String(text)); return true; });
+ipcMain.handle('out:copy', async (_e, { id }) => {
+  const tmp = tmpFile(`copy-${id}`);
+  try {
+    const res = await outputs.exportPlain(id, tmp, { max: COPY_MAX });
+    clipboard.writeText(await fs.promises.readFile(tmp, 'utf8'));
+    return res;
+  } finally { fs.rm(tmp, { force: true }, () => {}); }
+});
+
+ipcMain.handle('out:save', async (_e, { id, name }) => {
+  const base = String(name || 'output').replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'output';
+  const res = await dialog.showSaveDialog(win, { defaultPath: path.join(app.getPath('downloads'), `${base}.txt`) });
+  if (res.canceled || !res.filePath) return null;
+  const out = await outputs.exportPlain(id, res.filePath);
+  return { path: res.filePath, ...out };
+});
+
+// Opens the output in the default editor for .txt files. A log with no
+// escapes is linked rather than copied; one with colors is exported as text.
+ipcMain.handle('out:open', async (_e, { id }) => {
+  const info = await outputs.info(id);
+  if (!info || !info.bytes) return 'no output';
+  const txt = path.join(file('outputs'), `${id}.txt`);
+  fs.rmSync(txt, { force: true });
+  try {
+    if (info.hasEsc) throw new Error('export');
+    fs.linkSync(outputs.file(id), txt);
+  } catch { await outputs.exportPlain(id, txt); }
+  return shell.openPath(txt);
+});
 
 // ---------------------------------------------------------------- command bar
 // A snapshot path from the renderer is only used if it's one Loom wrote.
@@ -349,7 +455,7 @@ ipcMain.handle('history:import', () => {
 });
 
 // ---------------------------------------------------------------- structured data for rich views
-ipcMain.handle('fs:list', async (_e, { cwd, target, hidden }) => {
+async function listDir({ cwd, target, hidden }) {
   const dir = path.resolve(cwd || os.homedir(), expandHome(target || '.'));
   try {
     if (!(await fs.promises.stat(dir)).isDirectory()) return null;
@@ -369,7 +475,7 @@ ipcMain.handle('fs:list', async (_e, { cwd, target, hidden }) => {
     }));
     return { path: dir, entries, total: dirents.length };
   } catch { return null; }
-});
+}
 
 ipcMain.handle('fs:open', async (_e, p) => {
   if (typeof p !== 'string' || !path.isAbsolute(p) || !fs.existsSync(p)) return 'not found';
@@ -390,37 +496,38 @@ function git(cwd, args) {
   });
 }
 
-ipcMain.handle('git:log', async (_e, { cwd, args }) => {
+// git's own output for the rich-view worker, which parses it.
+function gitLogRaw({ cwd, args }) {
   const fmt = '%H%x1f%P%x1f%an%x1f%ar%x1f%s%x1f%D%x1e';
-  const a = ['log', `--format=${fmt}`, '--topo-order', ...args];
+  const a = ['log', `--format=${fmt}`, '--topo-order', ...args.map(String)];
   if (!args.some((x) => /^(-n\d*|--max-count.*|-\d+)$/.test(x))) a.push('-n', '300');
-  const out = await git(cwd, a);
-  if (out == null) return null;
-  const commits = out.split('\x1e').map((r) => r.replace(/^\n/, '')).filter(Boolean).map((r) => {
-    const [hash, parents, author, date, subject, refs] = r.split('\x1f');
-    return {
-      hash, author, date, subject,
-      parents: parents ? parents.split(' ') : [],
-      refs: refs ? refs.split(', ').filter(Boolean) : [],
-    };
-  });
-  return { commits };
-});
+  return git(cwd, a);
+}
+const gitStatusRaw = ({ cwd }) => git(cwd, ['status', '--porcelain=v1', '-b']);
 
-ipcMain.handle('git:status', async (_e, { cwd }) => {
-  const out = await git(cwd, ['status', '--porcelain=v1', '-b']);
-  if (out == null) return null;
-  let branch = '';
-  const files = [];
-  for (const line of out.split('\n')) {
-    if (!line) continue;
-    if (line.startsWith('## ')) { branch = line.slice(3); continue; }
-    const x = line[0]; const y = line[1];
-    let p = line.slice(3);
-    if (p.includes(' -> ')) p = p.split(' -> ').pop();
-    files.push({ x, y, path: p.replace(/^"|"$/g, '') });
-  }
-  return { branch, files };
+// ---------------------------------------------------------------- rich-view worker
+// The renderer's Web Worker talks to main over its own MessagePort, so the data
+// it parses never passes through the page's thread.
+const workerOps = {
+  head: ({ id, bytes }) => outputs.head(id, { bytes }),
+  listDir: (q) => listDir(q),
+  gitLog: (q) => gitLogRaw(q),
+  gitStatus: (q) => gitStatusRaw(q),
+  richGet: ({ id }) => outputs.getRich(id),
+  richPut: ({ id, value }) => outputs.putRich(id, value),
+};
+ipcMain.handle('worker:port', (e) => {
+  const { port1, port2 } = new MessageChannelMain();
+  port1.on('message', async ({ data }) => {
+    const { rid, op, arg } = data || {};
+    try {
+      if (!workerOps[op]) throw new Error(`no op ${op}`);
+      port1.postMessage({ rid, ok: true, value: await workerOps[op](arg || {}) });
+    } catch (err) { port1.postMessage({ rid, ok: false, error: err.message }); }
+  });
+  port1.start();
+  e.sender.postMessage('worker-port', null, [port2]);
+  return true;
 });
 
 // ---------------------------------------------------------------- Claude
@@ -462,6 +569,8 @@ ipcMain.handle('settings:get', () => {
     keyFromEnv: !!process.env.ANTHROPIC_API_KEY,
     forceColor: !!s.forceColor,
     realPager: !!s.realPager,
+    outputCapGB: Number(s.outputCapGB) || 1,
+    outputTotalGB: Number(s.outputTotalGB) || 5,
     shell: pickShell(),
   };
 });
@@ -479,7 +588,12 @@ ipcMain.handle('settings:set', (_e, patch) => {
       s.keyEncrypted = true;
     } else { s.apiKey = patch.apiKey; s.keyEncrypted = false; }
   }
+  for (const k of ['outputCapGB', 'outputTotalGB']) {
+    const v = Number(patch[k]);
+    if (Number.isFinite(v) && v > 0) s[k] = Math.min(v, 1024);
+  }
   writeJSON(file('settings.json'), s);
+  outputs.setCaps(capsFromSettings());
   if (pagerChanged && sessions) sessions.dropIdle();
   return true;
 });
@@ -492,17 +606,90 @@ function pruneSnapshots(saved) {
   for (const name of names) if (!keep.has(name)) fs.rm(path.join(envDir(), name), { force: true }, () => {});
 }
 
+// session.json holds card metadata only; output lives in userData/outputs.
+// main keeps the session in memory, the renderer sends what changed, and the
+// file is written debounced, atomically, and only when its contents changed.
 const persistSession = !SMOKE || !!process.env.LOOM_SMOKE_USERDATA;
+let session = null; // { meta, nodes: Map id -> node }
+let sessionWritten = '';
+let sessionTimer = null;
+
+function sessionJSON() {
+  return JSON.stringify({ ...session.meta, v: 2, nodes: [...session.nodes.values()] });
+}
+function writeSession() {
+  clearTimeout(sessionTimer);
+  sessionTimer = null;
+  if (!persistSession || !session) return;
+  const json = sessionJSON();
+  if (json === sessionWritten) return;
+  try {
+    const p = file('session.json');
+    const tmp = `${p}.tmp`;
+    fs.writeFileSync(tmp, json);
+    fs.renameSync(tmp, p);
+    sessionWritten = json;
+  } catch (err) { console.warn(`session not saved: ${err.message}`); }
+}
+const writeSessionSoon = () => { if (!sessionTimer) sessionTimer = setTimeout(writeSession, 500); };
+
+// Sessions from before output files kept each card's output tail inline.
+function migrate(saved) {
+  let changed = false;
+  for (const n of saved.nodes || []) {
+    if (Array.isArray(n.segs)) {
+      const text = n.segs.map((x) => x[1]).join('');
+      if (text) {
+        const out = outputs.put(n.id, text);
+        if (n.h == null) n.h = 62 + Math.min(out.lines * 19 + 22, n.bodyH || 300);
+      }
+      delete n.segs;
+      changed = true;
+    }
+    if (n.rich) {
+      if (['files', 'gitlog', 'gitstatus'].includes(n.rich.kind)) outputs.putRich(n.id, n.rich);
+      n.richKind = n.rich.kind;
+      delete n.rich;
+      changed = true;
+    }
+  }
+  if (changed) {
+    try { fs.copyFileSync(file('session.json'), file('session.v1.json')); } catch { /* nothing to keep */ }
+  }
+  return changed;
+}
+
 ipcMain.handle('session:load', () => {
-  if (!persistSession) return null;
+  relay.reset();
+  if (!persistSession) { session = { meta: {}, nodes: new Map() }; return null; }
   const saved = readJSON(file('session.json'), null);
   pruneSnapshots(saved);
-  if (sessions) sessions.resetFlow();
-  return saved;
+  const changed = saved ? migrate(saved) : false;
+  const nodes = (saved && saved.nodes) || [];
+  outputs.prune(new Set(nodes.map((n) => n.id)));
+  const meta = saved ? { ...saved } : {};
+  delete meta.nodes;
+  session = { meta, nodes: new Map(nodes.map((n) => [n.id, n])) };
+  if (changed) writeSession(); else sessionWritten = saved ? sessionJSON() : '';
+  return saved ? { ...meta, v: 2, nodes } : null;
 });
+// { meta, nodes: { id: node | null } }: only what changed.
+ipcMain.handle('session:patch', (_e, patch) => {
+  if (!session) session = { meta: {}, nodes: new Map() };
+  if (patch.meta) Object.assign(session.meta, patch.meta);
+  for (const [id, n] of Object.entries(patch.nodes || {})) {
+    if (n) session.nodes.set(Number(id), n); else session.nodes.delete(Number(id));
+  }
+  writeSessionSoon();
+  return true;
+});
+// The whole session at once (the e2e run, and before quitting).
 ipcMain.handle('session:save', (_e, data) => {
-  if (!persistSession) return true;
-  try { writeJSON(file('session.json'), data); return true; } catch { return false; }
+  const meta = { ...data };
+  delete meta.nodes;
+  session = { meta, nodes: new Map((data.nodes || []).map((n) => [n.id, n])) };
+  writeSession();
+  return true;
 });
 
 ipcMain.handle('sys:info', () => ({
@@ -512,7 +699,10 @@ ipcMain.handle('sys:info', () => ({
   user: os.userInfo().username,
   shell: path.basename(pickShell()),
   smoke: !!SMOKE,
+  bench: BENCH,
+  procStart: PROC_START,
   smokeResume: !!process.env.LOOM_SMOKE_RESUME,
+  smokeMigrate: !!process.env.LOOM_SMOKE_MIGRATE,
   e2e: SMOKE ? { sudoPass: process.env.E2E_SUDO_PASS || '', ssh: !!process.env.E2E_SSH } : null,
   sessions: !!sessions,
 }));
@@ -533,6 +723,24 @@ ipcMain.handle('smoke:keys', async (_e, keys) => {
   }
 });
 
+ipcMain.handle('smoke:copy', () => { if (SMOKE && win) win.webContents.copy(); });
+ipcMain.handle('smoke:clipboard', (_e, { write } = {}) => {
+  if (!SMOKE) return null;
+  if (typeof write === 'string') { clipboard.writeText(write); return write; }
+  return clipboard.readText();
+});
+
+// The whole output as text, for the e2e checks.
+ipcMain.handle('smoke:out', async (_e, { id, raw }) => {
+  if (!SMOKE) return null;
+  await outputs.load(id);
+  outputs.flushAll();
+  try {
+    const t = fs.readFileSync(outputs.file(id), 'utf8');
+    return raw ? t : t.split('\n').map(require('./renderer/wrap').visible).join('\n');
+  } catch { return ''; }
+});
+
 ipcMain.handle('smoke:resize', (_e, { width, height }) => { if (SMOKE && win) win.setSize(width, height); });
 
 // A real paste, through the clipboard and the page's paste event.
@@ -541,6 +749,31 @@ ipcMain.handle('smoke:paste', (_e, text) => {
   clipboard.writeText(text);
   win.webContents.paste();
 });
+
+// ---------------------------------------------------------------- bench
+// Peak working set per process type, sampled until the next mark.
+const benchPeak = { main: 0, renderer: 0, all: 0 };
+function sampleMemory() {
+  let main = 0; let renderer = 0; let all = 0;
+  for (const m of app.getAppMetrics()) {
+    const mb = m.memory.workingSetSize / 1024;
+    all += mb;
+    if (m.type === 'Browser') main += mb;
+    else if (m.type === 'Tab') renderer += mb;
+  }
+  benchPeak.main = Math.max(benchPeak.main, main);
+  benchPeak.renderer = Math.max(benchPeak.renderer, renderer);
+  benchPeak.all = Math.max(benchPeak.all, all);
+}
+if (SMOKE) app.whenReady().then(() => setInterval(sampleMemory, 200));
+ipcMain.handle('bench:mem', (_e, { reset } = {}) => {
+  sampleMemory();
+  const out = { ...benchPeak };
+  if (reset) Object.assign(benchPeak, { main: 0, renderer: 0, all: 0 });
+  return out;
+});
+// scripts/bench.js reads these lines.
+ipcMain.handle('bench:report', (_e, result) => { if (BENCH) console.log(`[bench] ${JSON.stringify(result)}`); });
 
 // test/e2e.js reads these lines.
 ipcMain.handle('smoke:report', (_e, results) => {
@@ -589,6 +822,7 @@ function createWindow() {
 
 app.whenReady().then(async () => {
   history = createHistory(file('history.jsonl'));
+  startOutputs();
   await resolveLoginPath();
   startSessions();
   shellInfo = createShellInfo({ shell: pickShell(), env: () => cmdEnv({ plain: true }), sessions });
@@ -600,6 +834,8 @@ app.whenReady().then(async () => {
 });
 
 app.on('before-quit', () => {
+  writeSession();
+  if (outputs) outputs.shutdown();
   if (sessions) sessions.shutdown();
   for (const p of procs.values()) {
     try { isWin ? p.child.kill() : process.kill(-p.child.pid, 'SIGTERM'); } catch { /* gone */ }

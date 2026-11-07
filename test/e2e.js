@@ -1,7 +1,8 @@
 'use strict';
 // End-to-end run: launches Loom with LOOM_SMOKE against a throwaway project and
 // home directory, once per shell, then again over the saved session to check
-// that a restart recreates a card's environment. Linux needs xvfb-run.
+// that a restart recreates a card's environment, then over a session saved in
+// the old format (output inline) to check its migration. Linux needs xvfb-run.
 // Usage: node test/e2e.js [zsh|bash ...]   E2E_RC appends to the fixture rc files.
 // E2E_SHOTS=<dir> keeps the screenshots. E2E_SUDO_PASS and E2E_SSH=1 turn on the
 // sudo password and ssh checks where a test account or sshd exists.
@@ -51,14 +52,32 @@ function fixture(shell) {
   return { root, home, cwd };
 }
 
+// A session.json from before output files: each card kept its output in `segs`.
+function oldSession(cwd) {
+  const now = Date.now();
+  const card = (o) => ({
+    cwd, cwdAfter: cwd, parentId: null, pipeFrom: null, x: 0, y: 0, w: 620, bodyH: 300, status: 'ok', exitCode: 0,
+    startedAt: now - 60000, endedAt: now - 59000, view: 'rich', ai: null, collapsed: false, envFile: null, rich: null, ...o,
+  });
+  return {
+    v: 1, nextId: 4, view: { x: 120, y: 90, k: 1 }, activeId: 1, rootCwd: cwd, sidebar: false,
+    nodes: [
+      card({ id: 1, cmd: 'echo old', segs: [[0, 'old output line 1\nold output line 2\n\x1b[31mred line\x1b[0m\n']] }),
+      card({ id: 2, cmd: 'ls', parentId: 1, y: 260, segs: [[0, 'a.txt\nb.txt\n']], rich: { kind: 'files', data: { path: cwd, total: 1, entries: [{ name: 'a.txt', dir: false, link: false, size: 1, mtime: now, exec: false }] } } }),
+      card({ id: 3, cmd: 'false', parentId: 1, x: 700, y: 260, status: 'error', exitCode: 1, segs: [] }),
+    ],
+  };
+}
+
 function launch(shell, fx, extra) {
   const env = {
-    ...process.env, ...extra,
+    ...process.env,
     SHELL: spawnSync('which', [shell]).stdout.toString().trim(),
     HOME: fx.home,
     LOOM_SMOKE: path.join(fx.root, 'smoke.png'),
     LOOM_SMOKE_CWD: fx.cwd,
     LOOM_SMOKE_USERDATA: path.join(fx.root, 'userData'),
+    ...extra,
   };
   delete env.ELECTRON_RUN_AS_NODE;
   delete env.ZDOTDIR;
@@ -108,6 +127,24 @@ function report(label, out) {
     const untouched = ['.zsh_history', '.bash_history'].map((f) => hash(path.join(fx.home, f))).join() === histHash;
     console.log(`${shell} ${untouched ? 'PASS' : 'FAIL'} ~/.zsh_history and ~/.bash_history unchanged`);
     if (!untouched) failed++;
+    // ---- migration of an old session
+    const mig = path.join(fx.root, 'userData-old');
+    fs.mkdirSync(mig, { recursive: true });
+    fs.writeFileSync(path.join(mig, 'session.json'), JSON.stringify(oldSession(fx.cwd)));
+    failed += report(`${shell} (migrate)`, await launch(shell, fx, { LOOM_SMOKE_MIGRATE: '1', LOOM_SMOKE_USERDATA: mig }));
+    const after = JSON.parse(fs.readFileSync(path.join(mig, 'session.json'), 'utf8'));
+    const logs = ['1', '2'].every((id) => fs.existsSync(path.join(mig, 'outputs', `${id}.log`)));
+    const migOk = after.v === 2 && !JSON.stringify(after).includes('"segs"') && logs && fs.existsSync(path.join(mig, 'session.v1.json'))
+      && fs.readFileSync(path.join(mig, 'outputs', '1.log'), 'utf8').startsWith('old output line 1');
+    console.log(`${shell} ${migOk ? 'PASS' : 'FAIL'} migrate: session.json is metadata only, output moved to files, old file kept`);
+    if (!migOk) failed++;
+    const outFiles = fs.readdirSync(path.join(fx.root, 'userData', 'outputs')).length;
+    const sessText = fs.readFileSync(path.join(fx.root, 'userData', 'session.json'), 'utf8');
+    const sess = JSON.parse(sessText);
+    const perCard = sessText.length / sess.nodes.length;
+    const small = !sessText.includes('"segs"') && !sessText.includes('alias-ok') && !sessText.includes('1.00001e+06') && perCard < 1000 && outFiles > 10;
+    console.log(`${shell} ${small ? 'PASS' : 'FAIL'} session.json holds no output (${sessText.length} bytes for ${sess.nodes.length} cards, ${outFiles} output files)`);
+    if (!small) failed++;
     if (process.env.E2E_SHOTS) {
       fs.mkdirSync(process.env.E2E_SHOTS, { recursive: true });
       for (const f of fs.readdirSync(fx.root)) if (f.endsWith('.png')) fs.copyFileSync(path.join(fx.root, f), path.join(process.env.E2E_SHOTS, `${shell}-${f}`));

@@ -1,16 +1,18 @@
 'use strict';
-// Terminal side of a running card. Every running card has an xterm Terminal
-// that interprets its output, usually never attached to the DOM. A card the
-// user is looking at also gets a live view: that same Terminal opened in an
-// unscaled layer over the card, because xterm blurs and misplaces the mouse
-// under CSS transforms. When the card ends, its buffer becomes plain text for
-// the cheap HTML card and the Terminal is disposed.
+// Terminal side of a running card. main.js records every card's output; a
+// running card that needs a screen (on screen, live, or on the alternate
+// screen) also has an xterm Terminal that interprets it, usually never
+// attached to the DOM. A card the user is looking at gets a live view: that
+// same Terminal opened in an unscaled layer over the card, because xterm blurs
+// and misplaces the mouse under CSS transforms. A model opened on a card that
+// was already running starts from main's replay of its screen. When the card
+// ends, its output file is the card's text, except when the program moved the
+// cursor: then the normal-screen buffer is, and goes back to main.
 (function (g) {
   const { Ansi } = g;
   const MAX_LIVE = 8; // browsers cap WebGL contexts at about 16 per page
   const MIN_ZOOM = 0.6;
   const SCROLLBACK = 10000;
-  const RAW_MAX = 5 * 1024 * 1024;
   const FONT = 12;
   const OVERLAY_FONT = 13;
   const ESC_ESC_MS = 400;
@@ -80,19 +82,6 @@
     return lines.join('\n');
   }
 
-  // Output with no cursor movement doesn't need the terminal's interpretation,
-  // and raw text is better when it's available: it keeps tabs, which rich views
-  // and pipes care about, and isn't limited by scrollback. Null means use the buffer.
-  function plainText(raw) {
-    const text = raw.replace(/\r+\n/g, '\n');
-    const rest = text
-      .replace(/\x1b\[[0-9;:]*m/g, '')
-      .replace(/\x1b\[[0-2]?K/g, '')
-      .replace(/\x1b\[\?[0-9;]*[hl]/g, '')
-      .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '');
-    return /[\x1b\r\x08]/.test(rest) ? null : text;
-  }
-
   // ---------------------------------------------------------------- manager
   // opts: api, layer, overlay (element), slot (element in the overlay),
   // rect(n) -> { x, y, w, h, k, shown } in viewport pixels,
@@ -105,8 +94,7 @@
     let overlaid = null;
     let peak = 0;
 
-    function attach(n) {
-      dispose(n.id);
+    const newTerm = () => {
       const term = new g.Terminal({
         cols: 120, rows: 40, scrollback: SCROLLBACK, allowProposedApi: true,
         fontFamily: monoFont(), fontSize: FONT, lineHeight: 1.2, theme: theme(),
@@ -114,12 +102,31 @@
       });
       term.loadAddon(new g.Unicode11Addon.Unicode11Addon());
       term.unicode.activeVersion = '11';
+      return term;
+    };
+
+    // A model for a running card. `fresh`: main is already sending it
+    // everything (a card that just started); otherwise it asks main to start,
+    // and shows main's replay of the screen first.
+    function attach(n, { fresh = false } = {}) {
+      dispose(n.id);
+      const term = newTerm();
       const t = {
         n, term, fit: null, search: null, webgl: null, host: null, find: null, opened: false,
-        visible: false, focused: false, focusedAt: 0, lastEsc: 0, lastSnapshot: 0, snapTimer: null,
-        raw: '', rawOver: false, sawAlt: false, resizeTimer: null, fitTimer: null, w: 0, h: 0,
+        visible: false, focused: false, focusedAt: 0, lastEsc: 0, lastSnapshot: 0, snapTimer: null, snap: '',
+        resizeTimer: null, fitTimer: null, w: 0, h: 0, queue: fresh ? null : [],
       };
       terms.set(n.id, t);
+      if (!fresh) {
+        api.outSubscribe({ id: n.id, on: true }).then((res) => {
+          if (terms.get(n.id) !== t) return;
+          const q = t.queue;
+          t.queue = null;
+          if (res && res.replay) t.term.write(res.replay);
+          for (const d of q) feed(t, d);
+          opts.onOutput(n);
+        });
+      }
       // Input and the terminal's own query replies go to the PTY and nowhere else.
       term.onData((data) => api.stdin({ id: n.id, data }));
       term.onBinary((data) => api.stdin({ id: n.id, data }));
@@ -127,24 +134,29 @@
         clearTimeout(t.resizeTimer);
         t.resizeTimer = setTimeout(() => api.resize({ id: n.id, cols, rows }), 60);
       });
-      term.buffer.onBufferChange((buf) => {
-        const alt = buf.type === 'alternate';
-        if (alt) t.sawAlt = true;
-        opts.onAlt(n, alt);
-      });
+      term.buffer.onBufferChange((buf) => opts.onAlt(n, buf.type === 'alternate'));
       term.attachCustomKeyEventHandler((e) => onKey(t, e));
       return t;
     }
 
-    function write(n, text) {
-      const t = terms.get(n.id);
-      if (!t) return;
-      if (t.raw.length + text.length <= RAW_MAX) t.raw += text;
-      else t.rawOver = true;
+    function feed(t, text) {
       t.term.write(text, () => {
-        api.ack({ id: n.id, bytes: text.length });
-        opts.onOutput(n);
+        api.ack({ id: t.n.id, bytes: text.length });
+        opts.onOutput(t.n);
       });
+    }
+
+    function write(id, text) {
+      const t = terms.get(id);
+      if (!t) { api.ack({ id, bytes: text.length }); return; }
+      if (t.queue) t.queue.push(text); else feed(t, text);
+    }
+
+    // The card doesn't need a screen any more: main stops sending.
+    function releaseModel(id) {
+      if (!terms.has(id)) return;
+      dispose(id);
+      api.outSubscribe({ id, on: false });
     }
 
     // ------------------------------------------------------------ keyboard
@@ -247,9 +259,9 @@
       peak = Math.max(peak, attached.size);
       position(t);
       if (!t.opened) open(t);
-      loadWebgl(t);
-      t.term.refresh(0, t.term.rows - 1);
       fitNow(t);
+      // WebGL compiles its shaders on load; a task of its own keeps both short.
+      setTimeout(() => { if (attached.has(t) && terms.get(t.n.id) === t) { loadWebgl(t); t.term.refresh(0, t.term.rows - 1); } }, 0);
     }
 
     // The Terminal stays as the card's model. Only its view and WebGL context go.
@@ -338,45 +350,47 @@
     }
 
     // ------------------------------------------------------------ text
-    // Keeps n.segs current for a running card that has no live view.
+    // The last lines of a running card with no live view, for its body.
     function snapshot(t) {
       const buf = t.term.buffer.active;
-      const text = bufferText(buf, Math.max(0, buf.length - SNAPSHOT_LINES));
-      t.n.segs = text ? [[0, text]] : [];
+      t.snap = bufferText(buf, Math.max(0, buf.length - SNAPSHOT_LINES));
       t.lastSnapshot = performance.now();
     }
 
-    // Returns true while a live view covers the card body.
+    // Returns { live: true } while a live view covers the card body, or the
+    // snapshot text (refreshed at most every SNAPSHOT_MS), or null with no model.
     function refresh(n, again) {
       const t = terms.get(n.id);
-      if (!t || t.visible) return !!t;
+      if (!t) return null;
+      if (t.visible) return { live: true };
       const wait = SNAPSHOT_MS - (performance.now() - t.lastSnapshot);
       if (wait <= 0) snapshot(t);
       else if (!t.snapTimer) t.snapTimer = setTimeout(() => { t.snapTimer = null; again(); }, wait);
-      return false;
+      return { text: t.snap };
     }
 
-    function snapshotNow(n) {
+    // A card ended. When its program moved the cursor (`moved`), the screen
+    // text is what the card keeps: from its model, or from a model fed main's
+    // replay if it had none. Null means the output file is the text as it is.
+    async function finish(n, { moved = false } = {}) {
       const t = terms.get(n.id);
-      if (t) snapshot(t);
-    }
-
-    function finalText(t) {
-      const plain = t.sawAlt || t.rawOver ? null : plainText(t.raw);
-      if (plain != null) return plain;
-      const text = bufferText(t.term.buffer.normal, 0);
-      return t.rawOver ? `[loom: over ${RAW_MAX / 1048576} MB of output, showing the last ${SCROLLBACK.toLocaleString()} lines]\n${text}` : text;
-    }
-
-    // The final text of a card that ended, once everything is parsed.
-    async function finish(n) {
-      const t = terms.get(n.id);
-      if (!t) return null;
-      await new Promise((r) => t.term.write('', r));
-      const focused = !!t.opened && document.activeElement === t.term.textarea;
-      if (overlaid === t) collapse();
-      const text = finalText(t);
-      dispose(n.id);
+      let focused = false;
+      let text = null;
+      if (t) {
+        await new Promise((r) => t.term.write('', r));
+        if (t.queue) await new Promise((r) => { const iv = setInterval(() => { if (!t.queue) { clearInterval(iv); r(); } }, 20); setTimeout(() => { clearInterval(iv); r(); }, 3000); });
+        await new Promise((r) => t.term.write('', r));
+        focused = !!t.opened && document.activeElement === t.term.textarea;
+        if (overlaid === t) collapse();
+        if (moved) text = bufferText(t.term.buffer.normal, 0);
+        dispose(n.id);
+      } else if (moved) {
+        const res = await api.outReplay({ id: n.id, full: true });
+        const term = newTerm();
+        await new Promise((r) => term.write((res && res.replay) || '', r));
+        text = bufferText(term.buffer.normal, 0);
+        term.dispose();
+      }
       return { text, focused };
     }
 
@@ -391,6 +405,7 @@
       clearTimeout(t.snapTimer);
       if (t.host) t.host.remove();
       t.term.dispose();
+      opts.onChange(t.n);
     }
 
     Ansi.lightTheme.addEventListener('change', () => {
@@ -402,8 +417,10 @@
     });
 
     return {
-      attach, write, show, layout, expand, collapse, refresh, snapshotNow, finish, dispose,
+      attach, write, release: releaseModel, show, layout, expand, collapse, refresh, finish, dispose,
+      has: (id) => terms.has(id),
       isLive: (id) => { const t = terms.get(id); return !!t && t.visible; },
+      isFocused: (id) => { const t = terms.get(id); return !!t && t.focused; },
       inAlt: (id) => { const t = terms.get(id); return !!t && t.term.buffer.active.type === 'alternate'; },
       // For the e2e run.
       stats: () => ({ live: attached.size, peak, models: terms.size, overlay: overlaid ? overlaid.n.id : null }),
@@ -411,5 +428,5 @@
     };
   }
 
-  g.Terminals = { create, plainText };
+  g.Terminals = { create, bufferText };
 })(window);

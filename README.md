@@ -57,7 +57,9 @@ To use the Claude features, open **Settings** and paste an Anthropic API key. Yo
 - When you're piping, Claude is told the command will read the previous card's output.
 - Failed cards offer **Explain with Claude**, which returns a short diagnosis plus a fix you can run as a child card.
 
-**History as a map.** **Map** (⌘/Ctrl+B) opens a branch-aware outline of everything you've run. Branches indent where they fork, and you can search the outline. Click any entry to fly to its card. The minimap in the corner shows the whole canvas, and you can click or drag it to navigate. Your session, including output, is saved and restored between launches.
+**Big output.** A card keeps up to 1 GB of output (Settings), all of it scrollable, and finished cards render only the lines in view. **⌘/Ctrl+F** searches a card's whole output and jumps between matches. Card actions copy the output, save it to a file (**Save output…**) or open it in your editor. Past the per-card limit a card stops recording (the command keeps running); past the total (5 GB by default) the oldest cards' output is removed.
+
+**History as a map.** **Map** (⌘/Ctrl+B) opens a branch-aware outline of everything you've run. Branches indent where they fork, and you can search the outline. Click any entry to fly to its card. The minimap in the corner shows the whole canvas; click a card on it to go there, or drag to navigate. Your session, including output, is saved and restored between launches. Below 55% zoom cards become pills (status, command, duration), and below 25% the canvas is drawn as one picture, so a session of thousands of cards stays smooth.
 
 ## Keyboard
 
@@ -81,6 +83,8 @@ To use the Claude features, open **Settings** and paste an Anthropic API key. Yo
 | ⌘/Ctrl+0 | Fit everything |
 | ⌘/Ctrl+N | Start a new root |
 | ⌘/Ctrl+B | Toggle the map |
+| ⌘/Ctrl+F | Find in the active card's output (Enter / Shift+Enter: next / previous) |
+| PageUp/PageDown, Home/End | Scroll a card's output when it has focus |
 
 In a live terminal, every key goes to the program, including Ctrl+C, Ctrl+D, Ctrl+Z, arrows, Tab and Esc. The exceptions:
 
@@ -105,6 +109,9 @@ lib/
   shellinfo.js  PATH executables, env snapshots → variables, the rc files' definitions
   complete.js   completion providers and the Fig spec walker
   history.js    history.jsonl, zsh/bash history parsers
+  outputs.js    each card's output file, its line index, range reads, caps and eviction
+  relay.js      running cards' output to the renderer: per-frame batches, flow control
+  search-worker.js  full-output search in a worker thread
 preload.js    contextBridge API (the renderer has no Node access)
 renderer/
   app.js      canvas, cards, layout, composer, Claude flows, map, minimap, persistence
@@ -112,14 +119,45 @@ renderer/
   shell-lex.js  shell lexer: tokens, isIncomplete, contextAt (also require()d by main and tests)
   fuzzy.js    fuzzy match, history ranking, ghost suggestions (also require()d by tests)
   terminals.js  terminal model per running card, live views, overlay, buffer → text
+  vlines.js   finished output, virtualized: rows from main, wrapping, colors, copy, find
+  wrap.js     wcwidth and rows per line (also require()d by main and tests)
+  spatial.js  grid index of card rectangles (also require()d by tests)
+  detect-worker.js  rich-view detection and parsing, in a Web Worker
+  bench.js    the renderer half of npm run bench
   views.js    rich-view detection + renderers (files, JSON, tables, git graph, git status)
   ansi.js     ANSI color → HTML
   styles.css  dark and light themes (follows the OS)
 test/
   *.test.js   unit tests (npm test): stream parser, shell lexer, history and ranking, completion
               providers against a temp folder
-  e2e.js          LOOM_SMOKE run per shell, plus a restart (npm run e2e; xvfb-run on Linux)
+  e2e.js          LOOM_SMOKE run per shell, plus a restart and an old-session migration
+                  (npm run e2e; xvfb-run on Linux)
+scripts/
+  bench.js        npm run bench
+  gen-fixture.js  generates a 1,000-card (or larger) session for the bench
 ```
+
+**Output.** Main records every byte a card prints in `userData/outputs/<id>.log` (line endings as `\n`), whether or not anything is on screen.
+- `lib/outputs.js` keeps an index per card: the byte offset of every 256th line, the SGR (color) state at each of those lines, and the extent in cells of every line wider than 32 cells, 2 bytes a line in blocks that have one. That's enough to read any range of lines in one seek, render it in color, and know the row count of the whole output at any card width without reading it. The index is saved next to the log (`<id>.idx`) when a card ends and rebuilt from the log if it's missing.
+- `renderer/wrap.js` defines how a line wraps (tabs every 8 cells, a wcwidth table for CJK, emoji and combining marks, `\r` overwrites and backspaces applied first). Main and the card body use the same code, so main's row counts match what the page draws.
+- A finished card's body is `renderer/vlines.js`: only the rows in view plus 40 rows of overscan are in the DOM, fetched from main in chunks of 128 rows (`out:view`) and kept in a small cache. Scrolling is its own (wheel, keys, a drawn scrollbar), because a browser can't scroll an element billions of pixels tall. Copy works from model coordinates, so a selection whose start has scrolled out of the DOM still copies whole, from main (`out:range`).
+- ⌘/Ctrl+F runs `lib/search-worker.js` in a worker thread over the file, with the same line splitting as the index, and returns match lines; the card asks main which row each one is at.
+- Copy output, pipes between cards, Save output… and Open in editor stream the visible text from the file in main. Rich views ask for the first 4 MB; Explain with Claude gets the head and tail.
+
+**Streaming.** `lib/relay.js` sends a running card's output to the page only while the page watches it: the card is on screen at 55% zoom or more, has a live view, is in the overlay, or is on the alternate screen. Off-screen cards cost the page nothing, and a card coming back into view gets a replay of its screen from main.
+- At most one message per card per frame, 128 KB at most. The page acknowledges what xterm has parsed; past 1 MB unacknowledged, a program that moves the cursor has its PTY paused until it's under 256 KB.
+- Plain line output isn't paused: it runs at full speed into the file, and each frame the view gets the newest 64 KB, more than a screen shows.
+- When a card ends, the file is its text, unless the program moved the cursor (progress bars with cursor-up, `top`, `clear`): then the normal-screen buffer of its terminal model is, as before, and replaces the file.
+
+**Canvas.** The tree (children, depth) is kept up to date on add, remove and reparent. Card heights come from a ResizeObserver and are saved, so layout never reads the DOM. A grid of 512 px buckets (`renderer/spatial.js`) answers placement overlap checks, culling and minimap hit tests.
+- Cards near the view have their DOM. Within a few screens they're empty boxes of the same size; further out they're out of the DOM (layout and edges use the grid). Mounting is spread over frames, nearest first.
+- Edges are one SVG path each; only edges with a moved end get a new path, and only edges near the view are in the SVG.
+- The minimap's cards are drawn into an offscreen canvas, again only when cards change; pan and zoom redraw the viewport rectangle. The history map is a virtual list.
+- Rich-view detection and parsing (JSON, CSV/TSV, column tables, git log and status) run in `renderer/detect-worker.js`, a Web Worker with its own MessagePort to main, so the output never passes through the page. Parsed JSON and tables stay in the worker; the JSON tree asks for a node's children when opened, and tables render only the rows in view, sorted in the worker.
+
+**Saving.** `session.json` holds card metadata only. The page sends main the cards that changed, and main writes the file debounced, atomically, and only when its contents changed. Sessions from before output files are migrated on first launch (their inline output becomes files; the old file is kept as `session.v1.json`).
+
+**Bench.** `npm run bench` launches Loom three times with the LOOM_SMOKE harness (under `xvfb-run` on Linux) and checks the budgets: no task over 50 ms while `seq 1 3000000` and `yes` (200 B × 1,000,000 lines) stream, 60 fps panning and zooming a generated 1,000-card session, first paint under 1.5 s, and main plus renderer under 600 MB while a card takes 1 GB. It also measures time to idle, the history map with 20,000 cards, and keystroke latency during streams. It prints a table, appends the run to `bench-results.json` (compared with the previous run), and exits 1 if a budget is missed by more than 25%. `--only stream|startup|map` runs one part; `--label` names the run.
 
 **Sessions.** A branch's shell is a bash or zsh in a 120×40 PTY with `TERM=xterm-256color`.
 - Integration is injected without touching your dotfiles. bash gets `--rcfile` pointing at a generated file. zsh gets a temporary `ZDOTDIR` whose startup files run your real ones. On macOS bash runs the login files too, as a terminal would; on Linux it runs `~/.bashrc`.
@@ -156,7 +194,12 @@ The ls and git views query the file system and git directly for structured data 
 - **ssh cards stay running until ssh exits.** Shell-integration markers don't come back from the remote shell, so the remote session is one card, and remote commands aren't split into cards.
 - **A long-running card takes the keyboard from an empty composer**, so running a second command beside it starts with Esc Esc. Keys typed in the 150 ms before that also go to the card, so a typed-ahead password can't become a command. If the command finishes first, those keys are lost.
 - **Ctrl+Z ends the card.** The shell regains control and the card finishes with exit 148, or 20 in some shells. The job stays suspended in the branch's shell, so a child card can run `fg` or `kill %1`.
-- **Over 5 MB of output**, or output that moves the cursor, keeps only the last 10,000 lines on the finished card.
+- **Output that moves the cursor** keeps what the terminal's normal screen held: the last 10,000 lines. Plain output keeps everything up to the per-card limit.
+- **A running card's live view skips ahead during a flood.** Its scrollback has gaps; the finished card has every line.
+- **Lines longer than 16 KB are split** in the index. They show as wrapped rows, copy joins them back, but a search match that spans the split isn't found.
+- **Memory is mostly fixed cost.** Main plus renderer idle at about 300 MB, and a live terminal's WebGL context adds about 100 MB; a 1 GB card adds little on top (see the bench). The GPU process isn't counted in the budget.
+- **Copy of a whole output stops at 32 MB**; Save output… has no limit. Open in editor exports text with colors stripped when the log has escape codes.
+- **Far-away cards aren't in the DOM**, so the browser's own find (there isn't one in Loom) or screen readers only see cards near the view.
 - **Echoed input is output.** Passwords that a program hides are never seen, but anything the program echoes back lands on the card and in the session file, as it would in a terminal's scrollback.
 - A live terminal sits above other cards, even one dragged over it.
 - **stdout and stderr are merged.** A PTY has one stream, so errors are no longer tinted and a card-to-card pipe carries both.
@@ -170,7 +213,7 @@ The ls and git views query the file system and git directly for structured data 
 - **Commands don't enter your shell history.** Loom turns history off in its sessions so its temp-script lines stay out of `~/.zsh_history` and `~/.bash_history`.
 - `exit` and `set -e` end a branch's shell, as they would a terminal window. The next card starts a new shell from the nearest snapshot.
 - A prompt theme that rewrites the prompt after Loom's hook loses the 133;B marker. Loom then treats 133;A plus 150 ms as ready, so this only costs a little latency.
-- Finished cards don't reflow if the card is resized, and a program that printed at a narrower live width stays wrapped at that width.
+- A program that printed at a narrower live width keeps its own line breaks. Finished cards rewrap when resized.
 - **Force color** now only affects the fallback path, since session commands are on a real terminal.
 - Ideas that fit the model:
   - Sticky notes on the canvas

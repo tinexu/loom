@@ -27,13 +27,13 @@
     <div class="side-head">
       <input id="map-search" type="search" placeholder="Search history" spellcheck="false">
     </div>
-    <div id="map-tree"></div>
+    <div id="map-tree"><div id="map-rows"></div><div class="tr-empty" id="map-empty" hidden>Commands you run show up here as a map of branches.</div></div>
     <div class="side-foot" id="map-stats"></div>
   </aside>
 
   <main id="viewport">
     <div id="world">
-      <svg id="edges" width="1" height="1"></svg>
+      <svg id="edges" width="1" height="1"><g id="edge-paths"></g><g id="edge-labels"></g></svg>
       <div id="cards"></div>
     </div>
     <div id="empty" hidden>
@@ -47,6 +47,7 @@
         <button class="chip" data-ask="find the 10 largest files under here">? find the 10 largest files under here</button>
       </div>
     </div>
+    <canvas id="far" hidden></canvas>
     <div id="live-layer"></div>
     <canvas id="minimap" width="220" height="140"></canvas>
   </main>
@@ -97,6 +98,15 @@
       <label class="check"><input type="checkbox" id="set-pager"> Use a real pager
         <span class="muted">Commands like <code>git log</code> open your pager in a live terminal, and don't get rich views or finished cards until you quit it.</span>
       </label>
+      <div class="row-2">
+        <label>Output per card (GB)
+          <input id="set-cap" type="number" min="0.01" step="any">
+        </label>
+        <label>Output for all cards (GB)
+          <input id="set-total" type="number" min="0.01" step="any">
+        </label>
+      </div>
+      <p class="muted small">Past the first, a card stops recording (the command keeps running). Past the second, the oldest cards' output is removed.</p>
       <p class="muted small" id="set-shell"></p>
       <div class="dialog-actions">
         <button type="button" class="danger" id="set-clear">Clear canvas</button>
@@ -113,12 +123,16 @@
   <script src="vendor/addon-unicode11.js"></script>
   <script src="vendor/addon-web-links.js"></script>
   <script src="vendor/addon-search.js"></script>
+  <script src="wrap.js"></script>
+  <script src="spatial.js"></script>
   <script src="shell-lex.js"></script>
   <script src="fuzzy.js"></script>
   <script src="ansi.js"></script>
   <script src="views.js"></script>
+  <script src="vlines.js"></script>
   <script src="terminals.js"></script>
   <script src="editor.js"></script>
+  <script src="bench.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
