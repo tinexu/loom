@@ -32,6 +32,14 @@ To use the Claude features, open **Settings** and paste an Anthropic API key. Yo
 - Below 60% zoom, or when off-screen, a running card shows a snapshot instead of a live terminal.
 - What you type into a terminal is never stored.
 
+**A command bar that knows your shell.** The bar is a multi-line editor with zsh-style conveniences, using the active card's folder and branch shell as context.
+- **Highlighting.** Commands are red when nothing on that card's `PATH`, and no alias, function or builtin of its shell, has that name. Flags, strings, variables, operators, comments and globs have their own colors, and arguments that are existing paths are underlined.
+- **Tab completion** in a popup: files and folders (spaces escaped, folders reopen the list), commands, git branches, tags, remotes and changed files, `npm`/`pnpm`/`yarn`/`bun run` scripts, `make` targets, `ssh`/`scp` hosts from `~/.ssh/config` and `known_hosts`, docker containers, PIDs for `kill`, and `$VARIABLES`. Flags and subcommands for about 700 other tools come from [Fig's open-source specs](https://github.com/withfig/autocomplete) with their descriptions.
+- **Ghost text** after the caret: the best earlier command that starts with what you typed, preferring ones run in this folder and ones that worked. → accepts it, Alt/Option+→ one word. A command that failed with "command not found" is never suggested.
+- **Ctrl+R** searches history fuzzily. Each result shows its folder, exit status and age. Press Ctrl+R again to switch between this branch, this folder and everything.
+- **Multi-line editing.** Enter runs the command unless it's unfinished (an open quote or `$(`, a trailing `\`, `|`, `&&` or `||`, or a heredoc without its terminator), in which case it adds a line. Pasted scripts never run until you press Enter.
+- **History** lives in `userData/history.jsonl` (20,000 commands, with folder, exit code, duration and branch). Like zsh and bash with `ignorespace`, **a command that starts with a space isn't recorded**. Its card still appears on the canvas and in the map like any other. On first launch Loom offers once to import `~/.zsh_history` and `~/.bash_history`. It only reads them, and you can import later from Settings.
+
 **Rich output views.** For a few command types, Loom renders the output as interactive UI. A **Raw** tab is always one click away.
 
 | Command | View |
@@ -44,7 +52,7 @@ To use the Claude features, open **Settings** and paste an Anthropic API key. Yo
 | `ps`, `df`, `docker ps`, `kubectl get`, … | Sortable table parsed from aligned columns |
 
 **Claude.**
-- Press **Tab** in the composer, or start a line with `?`, to describe what you want in plain English. Claude sees your OS, shell, current folder, the files in it and the recent commands on this branch.
+- Press **⌘/Ctrl+I** in the composer, or start a line with `?`, to describe what you want in plain English. Claude sees your OS, shell, current folder, the files in it and the recent commands on this branch.
 - Claude suggests one command with an explanation and a risk level (safe / caution / destructive). Destructive commands need a second confirmation before they run.
 - When you're piping, Claude is told the command will read the previous card's output.
 - Failed cards offer **Explain with Claude**, which returns a short diagnosis plus a fix you can run as a child card.
@@ -55,12 +63,19 @@ To use the Claude features, open **Settings** and paste an Anthropic API key. Yo
 
 | Keys | Action |
 |---|---|
-| Enter | Run (or ask Claude, in ✦ mode) |
-| Tab | Toggle shell / ask Claude |
-| ↑ / ↓ | Command history |
+| Enter | Run (or ask Claude, in ✦ mode). Adds a line if the command is unfinished |
+| Shift+Enter | New line |
+| Tab | Complete. With one match it's inserted; with a shared prefix, the prefix is |
+| ↑ / ↓ · Tab / Shift+Tab | Move in the completion list (Enter accepts, Esc closes) |
+| → or End | Accept the ghost suggestion |
+| Alt/Option+→ | Accept one word of it |
+| ↑ / ↓ | History filtered by what you've typed, when the caret is on the first / last line; otherwise they move the caret |
+| Ctrl+R | Search history. Ctrl+R again changes scope; Enter edits, Shift+Enter runs |
+| ⌘/Ctrl+I | Toggle shell / ask Claude |
+| ⌘/Ctrl+Z | Undo, including completions and accepted suggestions |
 | Ctrl+C | Stop the active card's process (from the composer) |
 | Ctrl+D | Send EOF to the active process (from the composer) |
-| Esc | Dismiss suggestion → cancel pipe → clear input |
+| Esc | Close popup → dismiss suggestion → cancel pipe → clear input |
 | ⌘/Ctrl+K or `/` | Focus the composer |
 | Alt+↑ / ↓ / ← / → | Move to parent / child / sibling card |
 | ⌘/Ctrl+0 | Fit everything |
@@ -79,22 +94,30 @@ In a live terminal, every key goes to the program, including Ctrl+C, Ctrl+D, Ctr
 
 ## How it's built
 
-There's no bundler or framework. The runtime dependencies are `node-pty`, a native module that `postinstall` rebuilds for Electron, and xterm.js with its fit, webgl, unicode11, web-links and search addons, which `postinstall` copies to `renderer/vendor/` (`scripts/vendor.js`) so plain `<script>` tags work under `script-src 'self'`.
+There's no bundler or framework. The runtime dependencies are `node-pty`, a native module that `postinstall` rebuilds for Electron; xterm.js with its fit, webgl, unicode11, web-links and search addons, which `postinstall` copies to `renderer/vendor/` (`scripts/vendor.js`) so plain `<script>` tags work under `script-src 'self'`; and `@withfig/autocomplete` (MIT), whose ES-module specs `main.js` loads on demand with `import()`.
 
 ```
 main.js       Electron main: routes commands, fs/git queries for rich views, Claude API
               calls, settings + session storage, the one-process-per-card fallback
 lib/
-  sessions.js PTY shell sessions: shell integration, OSC stream parser, branch → session
+  sessions.js PTY shell sessions: shell integration, OSC stream parser, branch → session,
+              the hidden alias/function/builtin helper
+  shellinfo.js  PATH executables, env snapshots → variables, the rc files' definitions
+  complete.js   completion providers and the Fig spec walker
+  history.js    history.jsonl, zsh/bash history parsers
 preload.js    contextBridge API (the renderer has no Node access)
 renderer/
   app.js      canvas, cards, layout, composer, Claude flows, map, minimap, persistence
+  editor.js   command bar: highlighted textarea, ghost text, completion popup, Ctrl+R
+  shell-lex.js  shell lexer: tokens, isIncomplete, contextAt (also require()d by main and tests)
+  fuzzy.js    fuzzy match, history ranking, ghost suggestions (also require()d by tests)
   terminals.js  terminal model per running card, live views, overlay, buffer → text
   views.js    rich-view detection + renderers (files, JSON, tables, git graph, git status)
   ansi.js     ANSI color → HTML
   styles.css  dark and light themes (follows the OS)
 test/
-  parser.test.js  stream parser unit tests (npm test)
+  *.test.js   unit tests (npm test): stream parser, shell lexer, history and ranking, completion
+              providers against a temp folder
   e2e.js          LOOM_SMOKE run per shell, plus a restart (npm run e2e; xvfb-run on Linux)
 ```
 
@@ -120,6 +143,12 @@ test/
 - Output reaches the renderer as raw PTY bytes with acknowledgements. Past 2 MB unacknowledged, the PTY pauses, so a program that floods output slows down as it would in a terminal, and long-lived programs are never cut off.
 - `PAGER` and `GIT_PAGER` stay `cat` so `git log` produces a finished card, while `MANPAGER` defaults to `less` so `man` is interactive. **Settings → Use a real pager** drops the `cat` default; idle shells pick it up by being recreated from their snapshots.
 
+**Command bar.** `renderer/editor.js` keeps a `<textarea>` with transparent text over a `<pre>` that shows the same text highlighted, with identical font, padding and wrapping. The browser still owns the caret, selection, IME and undo. Insertions use `execCommand('insertText')` so they're undoable.
+- `shell-lex.js` is a lexer, not a parser. It tracks quotes, `$(…)`, `${…}`, backticks, subshells, groups and heredocs well enough to color a line, decide whether Enter should add a line, and say which command, argument index and partial word the caret is in. Words after `|`, `&&`, `;`, `sudo`, `env`, `time`, `xargs` and `VAR=value` are in command position.
+- Aliases, functions and builtins come from the branch's own shell. Loom sources a small helper between cards with its output in a file, so no card sees it, and `$?` is passed through unchanged. It runs once per shell, and again after a card that could change them (`alias`, `source`, `nvm`…). Cards without an idle shell use a one-off interactive shell run at startup. `PATH` executables are cached per `PATH` and rescanned every 60 s. A card's `PATH` and variables come from its env snapshot, so a venv's tools count on the cards that use it. Only command names reach the renderer, never variable values.
+- Completion runs in `main.js` (`lib/complete.js`), with the active card's folder and environment. A new request cancels the one in flight, and the renderer ignores late answers. Fig specs are loaded with `import()` on first use and cached. Their generators that run a script are run in the card's folder with a 2 s timeout, and their results are cached for 5 s. `custom` generators, arbitrary JS that drives its own shell commands, are skipped.
+- Existing-path underlines are checked in batches over IPC after 120 ms and cached for 5 s.
+
 The ls and git views query the file system and git directly for structured data instead of parsing text.
 
 ## Known limits / next steps
@@ -134,6 +163,10 @@ The ls and git views query the file system and git directly for structured data 
 - **A fork inherits exported variables only.** Unexported variables, functions and aliases defined in a card, and `set`/`setopt` changes, stay in that card's shell. So a forked venv works, but its `deactivate` function isn't there. A variable your rc exports and a card `unset`s comes back in a fork. A session recreated after eviction or a restart has the same limits.
 - **Snapshots contain your exported environment in plain text**, including any tokens, in `userData/envs` (user-only permissions). They're removed with their card. `session.json` only holds their paths.
 - **Background jobs share the terminal.** A `&` job's output lands in whichever card is running when it prints, and is dropped between commands.
+- **Completion is prefix-first.** Fuzzy matches only show when nothing matches the prefix, so `cd sr` completes straight to `src/` and doesn't also offer `scripts/`.
+- **The lexer doesn't know `case` patterns, arrays (`a=(1 2)`) or process substitution `<(…)`.** Coloring can be off inside them, and a `)` in a `case` pattern inside `$(…)` closes it early.
+- **Fig specs** cover what's in `@withfig/autocomplete` 2.692. Versioned specs (`generateSpec`) use their static part, and `custom` generators are skipped, so a few tools offer fewer values than they did in Fig.
+- **Ctrl+R's "This branch"** means the tree of cards under the active card's root. Imported commands have no branch or folder, so they only show under All.
 - **Commands don't enter your shell history.** Loom turns history off in its sessions so its temp-script lines stay out of `~/.zsh_history` and `~/.bash_history`.
 - `exit` and `set -e` end a branch's shell, as they would a terminal window. The next card starts a new shell from the nearest snapshot.
 - A prompt theme that rewrites the prompt after Loom's hook loses the 133;B marker. Loom then treats 133;A plus 150 ms as ready, so this only costs a little latency.

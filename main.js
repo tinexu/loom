@@ -4,13 +4,16 @@
 // child process per card where those aren't available, and brokers file-system,
 // git and Claude calls for the renderer. The renderer never touches Node directly.
 
-const { app, BrowserWindow, ipcMain, safeStorage, shell, nativeTheme } = require('electron');
+const { app, BrowserWindow, ipcMain, safeStorage, shell, nativeTheme, clipboard } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { spawn, execFile } = require('child_process');
 const { StringDecoder } = require('string_decoder');
 const { createSessions } = require('./lib/sessions');
+const { createShellInfo } = require('./lib/shellinfo');
+const { createHistory, parseZshHistory, parseBashHistory } = require('./lib/history');
+const completer = require('./lib/complete');
 
 const isWin = process.platform === 'win32';
 const SMOKE = process.env.LOOM_SMOKE || '';
@@ -26,6 +29,8 @@ if (SMOKE) {
 let win = null;
 let loginPath = process.env.PATH || '';
 let sessions = null;
+let shellInfo = null;
+let history = null;
 const procs = new Map();
 
 // ---------------------------------------------------------------- storage
@@ -260,6 +265,89 @@ ipcMain.handle('cmd:resize', (_e, { id, cols, rows }) => { if (sessions) session
 ipcMain.handle('cmd:ack', (_e, { id, bytes }) => { if (sessions) sessions.ack(id, bytes); });
 ipcMain.handle('cmd:forget', (_e, id) => { if (sessions) sessions.forget(id); });
 
+// ---------------------------------------------------------------- command bar
+// A snapshot path from the renderer is only used if it's one Loom wrote.
+function snapshotPath(p) {
+  if (typeof p !== 'string') return null;
+  const full = path.resolve(p);
+  return path.dirname(full) === path.resolve(envDir()) ? full : null;
+}
+
+function cardInfo({ cardId, envFile }) {
+  return shellInfo.forCard({ cardId: Number.isFinite(cardId) ? cardId : null, envFile: snapshotPath(envFile) });
+}
+
+// Only command names cross to the renderer, never the environment's values.
+ipcMain.handle('shell:info', async (_e, req = {}) => {
+  const info = await cardInfo(req);
+  return info.key === req.have ? { key: info.key } : { key: info.key, commands: info.commands };
+});
+
+let completing = null;
+ipcMain.handle('complete:run', async (_e, req) => {
+  if (completing) completing.abort();
+  const ctl = new AbortController();
+  completing = ctl;
+  try {
+    const cwd = req.cwd && isDir(req.cwd) ? req.cwd : os.homedir();
+    const info = await cardInfo(req);
+    if (ctl.signal.aborted) return null;
+    return await completer.complete({
+      text: String(req.text || ''), caret: req.caret, cwd, commands: info.commands, env: info.env,
+      home: os.homedir(), signal: ctl.signal,
+    });
+  } catch (err) {
+    console.warn('completion failed', err);
+    return null;
+  } finally {
+    if (completing === ctl) completing = null;
+  }
+});
+
+ipcMain.handle('fs:exists', async (_e, { cwd, paths }) => {
+  const base = cwd && isDir(cwd) ? cwd : os.homedir();
+  return Promise.all((paths || []).slice(0, 200).map(async (p) => {
+    try {
+      const st = await fs.promises.stat(path.resolve(base, expandHome(String(p))));
+      return { e: true, d: st.isDirectory(), x: st.isFile() && !!(st.mode & 0o111) };
+    } catch { return { e: false }; }
+  }));
+});
+
+ipcMain.handle('history:load', () => history.all());
+ipcMain.handle('history:add', (_e, rec) => history.add(rec));
+
+// The shell's own history files are only ever read.
+function shellHistories() {
+  const home = os.homedir();
+  const read = (name) => { try { return fs.readFileSync(path.join(home, name)); } catch { return null; } };
+  const out = [];
+  const zsh = read('.zsh_history');
+  if (zsh && zsh.length) out.push({ name: '~/.zsh_history', records: parseZshHistory(zsh) });
+  const bash = read('.bash_history');
+  if (bash && bash.length) out.push({ name: '~/.bash_history', records: parseBashHistory(bash.toString('utf8')) });
+  return out.filter((h) => h.records.length);
+}
+
+// Offered once, on the first launch that finds a history file.
+ipcMain.handle('history:offer', () => {
+  const s = settings();
+  if (s.historyOffered) return null;
+  const found = shellHistories();
+  if (!found.length) return null;
+  s.historyOffered = true;
+  writeJSON(file('settings.json'), s);
+  return { sources: found.map((h) => ({ name: h.name, count: h.records.length })) };
+});
+
+ipcMain.handle('history:import', () => {
+  const found = shellHistories();
+  const list = [];
+  for (const h of found) list.push(...h.records);
+  list.sort((a, b) => (a.startedAt || 0) - (b.startedAt || 0));
+  return { added: history.importRecords(list), sources: found.map((h) => h.name) };
+});
+
 // ---------------------------------------------------------------- structured data for rich views
 ipcMain.handle('fs:list', async (_e, { cwd, target, hidden }) => {
   const dir = path.resolve(cwd || os.homedir(), expandHome(target || '.'));
@@ -447,6 +535,13 @@ ipcMain.handle('smoke:keys', async (_e, keys) => {
 
 ipcMain.handle('smoke:resize', (_e, { width, height }) => { if (SMOKE && win) win.setSize(width, height); });
 
+// A real paste, through the clipboard and the page's paste event.
+ipcMain.handle('smoke:paste', (_e, text) => {
+  if (!SMOKE || !win) return;
+  clipboard.writeText(text);
+  win.webContents.paste();
+});
+
 // test/e2e.js reads these lines.
 ipcMain.handle('smoke:report', (_e, results) => {
   if (!SMOKE) return;
@@ -493,9 +588,14 @@ function createWindow() {
 }
 
 app.whenReady().then(async () => {
+  history = createHistory(file('history.jsonl'));
   await resolveLoginPath();
   startSessions();
+  shellInfo = createShellInfo({ shell: pickShell(), env: () => cmdEnv({ plain: true }), sessions });
+  if (!isWin) shellInfo.probeBase();
   createWindow();
+  // Warm the specs people reach for first.
+  setTimeout(() => { for (const n of ['git', 'npm', 'docker']) completer.loadSpec(n); }, 3000);
   app.on('activate', () => { if (!BrowserWindow.getAllWindows().length) createWindow(); });
 });
 

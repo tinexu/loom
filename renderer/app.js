@@ -2,10 +2,11 @@
 // Loom renderer: the canvas, cards, composer, history map and Claude flows.
 (async function main() {
   const api = window.loom;
-  const { Ansi, Views } = window;
+  const { Ansi, Views, ShellLex } = window;
   const $ = (s) => document.querySelector(s);
   const sys = await api.sys();
   document.body.classList.add(`os-${sys.platform}`);
+  if (sys.platform !== 'darwin') document.querySelectorAll('.mod-key').forEach((k) => { k.textContent = 'Ctrl'; });
 
   const CARD_W = 620;
   const GAP_X = 72;
@@ -13,12 +14,13 @@
   const ANCHOR = 23; // x offset of the status dot, where edges attach
   const LIVE_DELAY = 150; // quick commands finish before they'd need a terminal
   const OS_NAME = { darwin: 'macOS', linux: 'Linux', win32: 'Windows' }[sys.platform] || sys.platform;
+  const MOD = sys.platform === 'darwin' ? '⌘' : 'Ctrl+';
 
   const els = {
     viewport: $('#viewport'), world: $('#world'), cards: $('#cards'), edges: $('#edges'),
     minimap: $('#minimap'), empty: $('#empty'),
     prompt: $('#prompt'), mode: $('#mode'), cwdChip: $('#cwd-chip'), pipeChip: $('#pipe-chip'),
-    hint: $('#hint'), suggestion: $('#suggestion'),
+    hint: $('#hint'), suggestion: $('#suggestion'), mirror: $('#prompt-hl'), complete: $('#complete'), hsearch: $('#hsearch'),
     sidebar: $('#sidebar'), tree: $('#map-tree'), search: $('#map-search'), stats: $('#map-stats'),
     zoomLabel: $('#zoom-label'), toasts: $('#toasts'),
   };
@@ -31,9 +33,7 @@
     rootCwd: sys.home,
     pipeFrom: null,
     mode: 'shell',
-    history: [],
-    histIdx: -1,
-    draft: '',
+    history: [], // records from main.js, oldest first
     suggestion: null,
   };
   const dom = new Map(); // node id -> element refs (kept out of the saved state)
@@ -730,8 +730,10 @@
   }
 
   // ================================================================ running commands
+  // A leading space keeps the command out of history, as with zsh and bash
+  // `ignorespace`.
   function runCommand(raw, { parentId = state.activeId, pipeFrom = null } = {}) {
-    const cmd = raw.trim();
+    const cmd = raw.replace(/^\n+|\s+$/g, '').replace(/^[ \t]+/, '');
     if (!cmd) return null;
     if (cmd === 'clear' || cmd === 'reset') { newRoot(); return null; }
     const parent = parentId != null ? state.nodes.get(parentId) : null;
@@ -740,9 +742,9 @@
       parentId: parent ? parent.id : null,
       pipeFrom,
       cwd: parent ? (parent.cwdAfter || parent.cwd) : state.rootCwd,
+      noHistory: /^[ \t]/.test(raw.replace(/^\n+/, '')),
     });
     placeNode(n, parent);
-    pushHistory(cmd);
     start(n);
     setActive(n.id, { takeKeyboard: true });
     requestAnimationFrame(() => reveal(n));
@@ -756,6 +758,7 @@
       noExpand: false,
     });
     terminals.attach(n);
+    recordStart(n);
     const src = n.pipeFrom != null ? state.nodes.get(n.pipeFrom) : null;
     if (n.pipeFrom != null && !src) n.pipeFrom = null;
     if (src) terminals.snapshotNow(src);
@@ -795,9 +798,10 @@
     // 130 is Ctrl+C, typed into the live terminal or sent by Stop.
     n.status = n.killed || signal || code === 130 ? 'killed' : code === 0 ? 'ok' : 'error';
     if (ended && ended.focused) focusPrompt();
+    recordEnd(n);
     updateCard(n);
     schedule(n);
-    if (id === state.activeId) updateComposer();
+    if (id === state.activeId) { updateComposer(); editor.refreshInfo(); }
     if (n.status === 'ok') {
       try {
         const rich = await Views.detect(n, api, stdoutOf(n));
@@ -872,29 +876,73 @@
     els.mode.innerHTML = ai ? ICON.spark : '$';
     els.prompt.placeholder = ai
       ? 'Describe what you want to do — Claude suggests a command'
-      : p ? `Command that reads #${p.id}'s output, e.g. grep, sort, wc -l` : 'Type a command';
-    els.hint.textContent = ai ? 'Tab · back to shell' : 'Tab · ask Claude';
+      : p ? `Command that reads #${p.id}'s output, e.g. grep, sort, wc -l` : `Type a command · Tab completes · ${MOD}I asks Claude`;
+    editor.render();
   }
 
   function focusPrompt() { terminals.collapse(); els.prompt.focus(); }
 
   // A new running card takes the keyboard, so sudo and REPLs work straight away,
   // unless the user has already started typing something else.
-  const composerIdle = () => !els.prompt.value.trim() && !state.suggestion && !$('#settings').open;
+  const composerIdle = () => !els.prompt.value.trim() && !state.suggestion && !$('#settings').open && !editor.busy();
 
-  function pushHistory(cmd) {
-    if (state.history[state.history.length - 1] !== cmd) state.history.push(cmd);
-    if (state.history.length > 1000) state.history.shift();
-    state.histIdx = -1;
+  // ---------------------------------------------------------------- history
+  // A record is in memory as soon as the command starts, so ↑ finds it, and is
+  // saved by main.js when it ends, with its exit code.
+  function rootOf(n) {
+    while (n && n.parentId != null && state.nodes.has(n.parentId)) n = state.nodes.get(n.parentId);
+    return n;
+  }
+
+  function recordStart(n) {
+    n.histRec = null;
+    if (n.noHistory) return;
+    const rec = { cmd: n.cmd, cwd: n.cwd, exitCode: null, startedAt: n.startedAt, durationMs: null, rootId: rootOf(n).id, cardId: n.id };
+    const H = state.history;
+    if (H.length && H[H.length - 1].cmd === rec.cmd) H[H.length - 1] = rec;
+    else H.push(rec);
+    if (H.length > 20000) H.splice(0, H.length - 20000);
+    n.histRec = rec;
+  }
+
+  function recordEnd(n) {
+    const rec = n.histRec;
+    if (!rec) return;
+    n.histRec = null;
+    rec.exitCode = n.exitCode;
+    rec.durationMs = n.endedAt - n.startedAt;
+    api.historyAdd(rec);
   }
 
   function setMode(m) {
     state.mode = m;
+    editor.closePopup();
     updateComposer();
     focusPrompt();
   }
 
   els.mode.addEventListener('click', () => setMode(state.mode === 'ai' ? 'shell' : 'ai'));
+
+  function editorContext() {
+    const a = state.nodes.get(state.activeId);
+    const root = a ? rootOf(a) : null;
+    return { cwd: currentCwd(), cardId: a ? a.id : null, envFile: nearestSnapshot(a), rootId: root ? root.id : null };
+  }
+
+  const editor = window.Editor.create({
+    api,
+    input: els.prompt,
+    mirror: els.mirror,
+    popup: els.complete,
+    search: els.hsearch,
+    hint: els.hint,
+    context: editorContext,
+    records: () => state.history,
+    mode: () => state.mode,
+    defaultHint: () => (state.mode === 'ai' ? `${MOD}I · back to shell` : `${MOD}I · ask Claude`),
+    onRun: (text) => submit(text),
+    fmt: { tilde, ago: fmtAgo },
+  });
 
   // Keys typed before a new card's terminal opens belong to that card, not the
   // composer: this could be a sudo password, which must never become a command.
@@ -908,51 +956,51 @@
     return true;
   }
 
+  // Runs the bar's text, or asks Claude about it. `raw` keeps a leading space.
+  function submit(raw) {
+    const text = raw.trim();
+    if (!text) return;
+    if (state.mode === 'ai' || text.startsWith('?')) { ask(text.replace(/^\?\s*/, '')); return; }
+    const pipe = state.pipeFrom;
+    runCommand(raw, { parentId: pipe ?? state.activeId, pipeFrom: pipe });
+    setPipe(null);
+  }
+
   els.prompt.addEventListener('keydown', (e) => {
     if (forwardTypeahead(e)) return;
+    if (editor.handleKey(e)) return;
     const v = els.prompt.value;
-    if (e.key === 'Enter' && !e.isComposing) {
+    const mod = e.metaKey || e.ctrlKey;
+    if (mod && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'i') {
       e.preventDefault();
-      const text = v.trim();
-      if (!text) return;
-      els.prompt.value = '';
-      if (state.mode === 'ai' || text.startsWith('?')) ask(text.replace(/^\?\s*/, ''));
-      else {
-        const pipe = state.pipeFrom;
-        runCommand(text, { parentId: pipe ?? state.activeId, pipeFrom: pipe });
-        setPipe(null);
-      }
+      setMode(state.mode === 'ai' ? 'shell' : 'ai');
       return;
     }
-    if (e.key === 'Tab') { e.preventDefault(); setMode(state.mode === 'ai' ? 'shell' : 'ai'); return; }
+    if (e.key === 'Enter' && !e.isComposing) {
+      // Shift+Enter, or an unfinished command (open quote, trailing |, heredoc…), adds a line.
+      e.preventDefault();
+      if (e.shiftKey || (state.mode === 'shell' && !v.trim().startsWith('?') && ShellLex.isIncomplete(v))) { editor.newline(); return; }
+      if (!v.trim()) return;
+      editor.clear();
+      submit(v);
+      return;
+    }
     if (e.key === 'Escape') {
       if (state.suggestion) hideSuggestion();
       else if (state.pipeFrom != null) setPipe(null);
-      else if (v) els.prompt.value = '';
+      else if (v) editor.clear();
       else els.prompt.blur();
       return;
     }
     if (e.key === 'c' && e.ctrlKey && !e.metaKey && els.prompt.selectionStart === els.prompt.selectionEnd) {
       const a = state.nodes.get(state.activeId);
       if (a && a.status === 'running') { e.preventDefault(); stop(a); }
-      else if (v) { e.preventDefault(); els.prompt.value = ''; }
+      else if (v) { e.preventDefault(); editor.clear(); }
       return;
     }
     if (e.key === 'd' && e.ctrlKey && !v) {
       const a = state.nodes.get(state.activeId);
       if (a && a.status === 'running') { e.preventDefault(); api.stdin({ id: a.id, eof: true }); }
-      return;
-    }
-    if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && state.mode === 'shell' && !e.altKey) {
-      const H = state.history;
-      if (!H.length) return;
-      e.preventDefault();
-      if (state.histIdx === -1) state.draft = v;
-      if (e.key === 'ArrowUp') state.histIdx = state.histIdx === -1 ? H.length - 1 : Math.max(0, state.histIdx - 1);
-      else state.histIdx = state.histIdx === -1 ? -1 : state.histIdx + 1;
-      if (state.histIdx >= H.length) state.histIdx = -1;
-      els.prompt.value = state.histIdx === -1 ? state.draft : H[state.histIdx];
-      els.prompt.setSelectionRange(els.prompt.value.length, els.prompt.value.length);
     }
   });
 
@@ -1068,7 +1116,7 @@ Respond with only a JSON object (no prose, no code fences):
     run.onclick = go;
     const edit = document.createElement('button');
     edit.textContent = 'Edit in shell';
-    edit.onclick = () => { const v = input.value; hideSuggestion(); setMode('shell'); els.prompt.value = v; };
+    edit.onclick = () => { const v = input.value; hideSuggestion(); setMode('shell'); editor.setValue(v); };
     actions.append(run, edit);
     input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') { e.preventDefault(); go(); }
@@ -1248,6 +1296,7 @@ Respond with only a JSON object (no prose, no code fences):
     await api.setSettings({ apiKey: '' });
     openSettings('Saved key removed.');
   });
+  $('#set-import').addEventListener('click', () => { dlg.close('cancel'); importHistory(); });
   $('#set-clear').addEventListener('click', () => {
     if (!window.confirm('Remove every card from the canvas? Running commands will be stopped.')) return;
     for (const n of [...state.nodes.values()]) { if (n.status === 'running') stop(n); terminals.dispose(n.id); api.forget(n.id); }
@@ -1289,6 +1338,8 @@ Respond with only a JSON object (no prose, no code fences):
     if (mod && e.key === '-') { e.preventDefault(); zoomCenter(1 / 1.2); return; }
     if (mod && e.key.toLowerCase() === 'b') { e.preventDefault(); toggleSidebar(); return; }
     if (mod && e.key.toLowerCase() === 'n') { e.preventDefault(); newRoot(); return; }
+    if (e.ctrlKey && !e.metaKey && e.key === 'r' && !typing) { e.preventDefault(); focusPrompt(); editor.openSearch(); return; }
+    if (mod && e.key.toLowerCase() === 'i' && !typing) { e.preventDefault(); setMode(state.mode === 'ai' ? 'shell' : 'ai'); return; }
     if (e.altKey && e.key.startsWith('Arrow')) {
       const a = state.nodes.get(state.activeId);
       if (!a) return;
@@ -1314,7 +1365,7 @@ Respond with only a JSON object (no prose, no code fences):
   window.addEventListener('resize', () => { drawMinimap(); });
 
   // ================================================================ persistence
-  const SAVE_FIELDS = ['id', 'cmd', 'cwd', 'cwdAfter', 'parentId', 'pipeFrom', 'x', 'y', 'w', 'bodyH', 'status', 'exitCode', 'startedAt', 'endedAt', 'view', 'ai', 'collapsed', 'envFile'];
+  const SAVE_FIELDS = ['id', 'cmd', 'cwd', 'cwdAfter', 'parentId', 'pipeFrom', 'x', 'y', 'w', 'bodyH', 'status', 'exitCode', 'startedAt', 'endedAt', 'view', 'ai', 'collapsed', 'envFile', 'noHistory'];
   function serialize() {
     const nodes = [...state.nodes.values()].map((n) => {
       if (n.status === 'running') terminals.snapshotNow(n);
@@ -1337,18 +1388,25 @@ Respond with only a JSON object (no prose, no code fences):
     });
     return {
       v: 1, nextId: state.nextId, view: state.view, activeId: state.activeId, rootCwd: state.rootCwd,
-      history: state.history.slice(-500), sidebar: !els.sidebar.hidden, nodes,
+      sidebar: !els.sidebar.hidden, nodes,
     };
   }
   const saveSoon = debounce(() => api.saveSession(serialize()), 800);
-  window.addEventListener('beforeunload', () => api.saveSession(serialize()));
+  window.addEventListener('beforeunload', () => {
+    // Commands still running are saved without an exit code.
+    for (const n of state.nodes.values()) if (n.histRec) api.historyAdd(n.histRec);
+    api.saveSession(serialize());
+  });
 
   async function restore() {
     const s = await api.loadSession();
     if (!s || s.v !== 1) return;
     state.nextId = s.nextId || 1;
     state.view = s.view || state.view;
-    state.history = s.history || [];
+    // Sessions from before history.jsonl kept a list of plain commands.
+    if (Array.isArray(s.history) && !state.history.length) {
+      for (const cmd of s.history) if (typeof cmd === 'string') { const r = { cmd, cwd: null, exitCode: null, startedAt: 0 }; state.history.push(r); api.historyAdd(r); }
+    }
     state.rootCwd = s.rootCwd || sys.home;
     for (const o of s.nodes || []) {
       const n = { ...o, killed: false, showAll: false, segs: o.segs || [] };
@@ -1361,12 +1419,33 @@ Respond with only a JSON object (no prose, no code fences):
     for (const n of state.nodes.values()) updateCard(n);
   }
 
+  // ================================================================ history import
+  async function importHistory() {
+    const res = await api.historyImport();
+    state.history = await api.historyLoad();
+    editor.render();
+    toast(res.added ? `Imported ${res.added.toLocaleString()} commands from ${res.sources.join(' and ')}` : 'No shell history found', { timeout: 3000 });
+    return res;
+  }
+
+  // Once, and only if asked: Loom reads ~/.zsh_history and ~/.bash_history but never writes them.
+  async function offerImport() {
+    const offer = await api.historyOffer();
+    if (!offer) return;
+    const total = offer.sources.reduce((a, x) => a + x.count, 0);
+    toast(`Use your ${offer.sources.map((x) => x.name).join(' and ')} (${total.toLocaleString()} commands) for suggestions and Ctrl+R?`, {
+      action: 'Import', onAction: importHistory, timeout: 20000,
+    });
+  }
+
   // ================================================================ boot
+  state.history = await api.historyLoad();
   await restore();
   applyView();
   updateComposer();
   scheduleLayout();
   focusPrompt();
+  offerImport();
 
   if (sys.smoke) {
     window.addEventListener('error', (e) => console.log(`ERR ${e.message} @${e.lineno}`));
@@ -1388,6 +1467,15 @@ Respond with only a JSON object (no prose, no code fences):
     if (sys.smokeResume) { await smokeResume({ run, text, check }); await api.smokeReport(results); api.smokeDone(); return; }
 
     check('uses PTY sessions', sys.sessions, sys);
+    // ---- first launch: one opt-in toast to import shell history
+    const until0 = async (fn, ms = 8000) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (fn()) return true; await wait(40); } return !!fn(); };
+    const offer = () => [...document.querySelectorAll('.toast')].find((t) => /zsh_history/.test(t.textContent));
+    check('import: first launch offers it in a toast', await until0(offer), [...document.querySelectorAll('.toast')].map((t) => t.textContent));
+    check('import: nothing imported before you ask', !state.history.some((r) => r.cmd === 'git checkout feature'), null);
+    if (offer()) offer().querySelector('button').click();
+    await until0(() => state.history.some((r) => r.cmd === 'git checkout feature'));
+    check('import: zsh extended format and bash history', ['git checkout feature', 'make deploy', 'cargo build --release'].every((c) => state.history.some((r) => r.cmd === c)), state.history.map((r) => r.cmd));
+    check('import: multi-line zsh entry', state.history.some((r) => r.cmd === 'for f in *; do\n  echo $f\ndone'), state.history.map((r) => r.cmd));
     toggleSidebar(true);
     const ls = runCommand('ls -a'); await done(ls);
     const log = runCommand('git log'); await done(log);
@@ -1529,6 +1617,7 @@ Respond with only a JSON object (no prose, no code fences):
     const e1 = await run('echo "$EVICT"; echo $$', e0);
     check('evicted session comes back from its snapshot', text(e1).split('\n')[0] === 'yes' && text(e1).split('\n')[1] !== text(e0), [text(e0), text(e1)]);
 
+    await smokeEditor({ run, text, check, wait, done });
     await smokeTerminals({ run, text, check, wait, done });
     const leak = [...state.nodes.values()].filter((n) => /LEAK|__loom|source '|133;/.test(text(n)));
     check('no prompt or hook text on any card', !leak.length, leak.map((n) => [n.cmd, allOutput(n).slice(0, 200)]));
@@ -1583,6 +1672,7 @@ Respond with only a JSON object (no prose, no code fences):
     const veil = getComputedStyle($('#term-overlay'));
     check('vim: overlay is actually on screen', veil.opacity === '1' && veil.display !== 'none' && document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2).closest('#term-overlay'), [veil.opacity, veil.display]);
     await api.smokeDone({ keep: true, suffix: 'vim' });
+    check('vim: takes the keyboard', await until(() => keyboardOn(vim)), [document.activeElement && (document.activeElement.id || document.activeElement.className), state.nodes.size]);
     await api.smokeKeys(['i', ...'edited-in-vim', ENTER, ESC, ':', 'w', 'q', ENTER]);
     await done(vim);
     check('vim: :wq exits 0', vim.status === 'ok' && vim.exitCode === 0, [vim.status, vim.exitCode]);
@@ -1729,7 +1819,7 @@ Respond with only a JSON object (no prose, no code fences):
     const ahead = start('cat');
     await api.smokeKeys([...'typed-ahead', ENTER]);
     check('typeahead: reaches the new card', await until(() => /typed-ahead/.test(screen(ahead))), screen(ahead).slice(0, 80));
-    check('typeahead: never becomes a command', !state.history.includes('typed-ahead') && !els.prompt.value, els.prompt.value);
+    check('typeahead: never becomes a command', !state.history.some((r) => r.cmd === 'typed-ahead') && !els.prompt.value, els.prompt.value);
     await api.smokeKeys([ctrl('D')]);
     await done(ahead);
 
@@ -1818,8 +1908,258 @@ Respond with only a JSON object (no prose, no code fences):
     check('finished cards keep no terminal', terminals.stats().models === 0 && !document.querySelector('.live-term'), terminals.stats());
   }
 
+  // The command bar, driven by real key events.
+  async function smokeEditor({ run, text, check, wait, done }) {
+    const until = async (fn, ms = 6000) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (fn()) return true; await wait(30); } return !!fn(); };
+    const key = (k, ...modifiers) => ({ key: k, modifiers });
+    const TAB = key('Tab');
+    const ENTER = key('Return');
+    const ESC = key('Escape');
+    const MODK = sys.platform === 'darwin' ? 'meta' : 'control';
+    const v = () => els.prompt.value;
+    const st = () => editor.stats();
+    const popup = () => st().popup || [];
+    const typeKeys = async (s) => { await api.smokeKeys([...s]); await wait(40); };
+    const insert = async (s) => { els.prompt.focus(); document.execCommand('insertText', false, s); await wait(40); };
+    const fresh = async () => { editor.clear(); setMode('shell'); focusPrompt(); await wait(30); };
+    const spanOf = (word) => [...els.mirror.querySelectorAll('span')].find((x) => x.textContent === word);
+    const cards = () => state.nodes.size;
+
+    const base = await run('pwd');
+    setActive(base.id);
+    reveal(base, true);
+    await editor.refreshInfo();
+
+    // ---- completion
+    await fresh();
+    await typeKeys('git checkout ');
+    await api.smokeKeys([TAB]);
+    check('complete: git checkout lists real branches', await until(() => ['feature', 'fix-typo'].every((b) => popup().includes(b))), popup());
+    await wait(150);
+    await api.smokeDone({ keep: true, suffix: 'complete' });
+    await api.smokeKeys([ESC]);
+    check('complete: Esc closes the popup', await until(() => !st().popup) && v() === 'git checkout ', v());
+
+    await fresh();
+    await typeKeys('npm run ');
+    await api.smokeKeys([TAB]);
+    check('complete: npm run lists package.json scripts', await until(() => ['build', 'test'].every((b) => popup().includes(b))), popup());
+    await api.smokeKeys([key('Down'), ENTER]);
+    check('complete: arrow + Enter inserts the choice', await until(() => /^npm run (build|test) $/.test(v())), v());
+
+    await fresh();
+    await typeKeys('cd sr');
+    const t0 = performance.now();
+    await api.smokeKeys([TAB]);
+    check('complete: cd sr + Tab → cd src/', await until(() => v() === 'cd src/'), v());
+    const ms = performance.now() - t0;
+    check('complete: dirs reopen completion', await until(() => popup().includes('lib/')), popup());
+    check('complete: paths answer in under 50 ms', st().lastComplete < 50, [st().lastComplete, ms]);
+    await api.smokeKeys([ESC]);
+
+    await fresh();
+    await typeKeys('cat my');
+    await api.smokeKeys([TAB]);
+    check('complete: my file.txt is escaped', await until(() => v() === 'cat my\\ file.txt '), v());
+    document.execCommand('undo');
+    check('complete: undo takes the completion back', await until(() => v() === 'cat my'), v());
+
+    await fresh();
+    await insert('cat "my');
+    await api.smokeKeys([TAB]);
+    check('complete: inside quotes, closes the quote', await until(() => v() === 'cat "my file.txt" '), v());
+
+    await fresh();
+    await typeKeys('tar -');
+    await api.smokeKeys([TAB]);
+    await until(() => popup().length > 5);
+    const descs = [...els.complete.querySelectorAll('.cp-row')].map((r) => [r.querySelector('.cp-label').textContent, r.querySelector('.cp-desc').textContent]);
+    check('complete: tar - shows flags with Fig descriptions', descs.length > 5 && descs.every(([l]) => l.startsWith('-')) && descs.filter(([, d]) => d).length > 5, descs.slice(0, 4));
+    check('complete: matched characters are bold', !!els.complete.querySelector('.cp-label b'), null);
+    await api.smokeKeys([ESC]);
+
+    await fresh();
+    await typeKeys('loomal');
+    await api.smokeKeys([TAB]);
+    check('complete: aliases from the rc file', await until(() => v() === 'loomalias '), v());
+
+    // ---- highlighting
+    const hl = async (line, word, want) => {
+      await fresh();
+      await insert(line);
+      return until(() => { editor.render(); const x = spanOf(word); return x && want(x.className); }, 4000);
+    };
+    check('highlight: gti is red', await hl('gti status', 'gti', (c) => c.includes('tk-bad')), spanOf('gti') && spanOf('gti').className);
+    check('highlight: git is a known command', await hl('git status', 'git', (c) => c === 'tk-cmd'), spanOf('git') && spanOf('git').className);
+    check('highlight: an alias from the rc file is not red', await hl('loomalias', 'loomalias', (c) => c === 'tk-cmd'), spanOf('loomalias') && spanOf('loomalias').className);
+    check('highlight: flags, strings, variables, operators', await hl('ls -la "x" $HOME | wc', '-la', (c) => c.includes('tk-flag'))
+      && spanOf('"x"').className.includes('tk-str') && spanOf('$HOME').className.includes('tk-var') && spanOf('|').className.includes('tk-op'), els.mirror.innerHTML);
+    check('highlight: existing paths are underlined', await hl('cat README.md nope.txt', 'README.md', (c) => c.includes('tk-path'))
+      && !(spanOf(' nope.txt') || { className: '' }).className.includes('tk-path'), els.mirror.innerHTML);
+    await api.smokeDone({ keep: true, suffix: 'highlight' });
+
+    // ---- Enter on an unfinished command, Shift+Enter, paste
+    await fresh();
+    let before = cards();
+    await insert('echo "unfinished');
+    await api.smokeKeys([ENTER]);
+    check('enter: open quote inserts a newline', await until(() => v() === 'echo "unfinished\n') && cards() === before, JSON.stringify(v()));
+    await insert('"');
+    await api.smokeKeys([ENTER]);
+    check('enter: closing the quote runs it', await until(() => cards() === before + 1 && !v()), [cards(), v()]);
+    const unfinished = [...state.nodes.values()].pop();
+    await done(unfinished);
+    check('enter: multi-line command ran whole', text(unfinished) === 'unfinished', text(unfinished));
+
+    await fresh();
+    await insert('echo a');
+    await api.smokeKeys([key('Return', 'shift')]);
+    check('shift+enter: always a newline', await until(() => v() === 'echo a\n'), JSON.stringify(v()));
+
+    await fresh();
+    before = cards();
+    await api.smokePaste('echo one\necho two\necho three\n');
+    await wait(500);
+    check("paste: a 3-line script doesn't run by itself", v() === 'echo one\necho two\necho three' && cards() === before, JSON.stringify(v()));
+    check('paste: hint says N lines · Enter to run', els.hint.textContent === '3 lines · Enter to run', els.hint.textContent);
+    await api.smokeKeys([ENTER]);
+    await until(() => cards() === before + 1);
+    const pasted = [...state.nodes.values()].pop();
+    await done(pasted);
+    check('paste: Enter runs it', text(pasted) === 'one\ntwo\nthree', text(pasted));
+
+    // ---- ↑/↓ move the caret inside a multi-line command
+    await fresh();
+    await insert('echo l1\necho l2');
+    await api.smokeKeys([key('Up')]);
+    check('up: on line 2 moves the caret, not history', v() === 'echo l1\necho l2' && els.prompt.selectionStart <= 7, [v(), els.prompt.selectionStart]);
+    await api.smokeKeys([key('Up')]);
+    check('up: on line 1 browses history', await until(() => v() !== 'echo l1\necho l2'), v());
+    await fresh();
+    await typeKeys('git c');
+    await api.smokeKeys([key('Up')]);
+    check('up: filtered by the typed prefix', v().startsWith('git c'), v());
+
+    // ---- ghost text
+    await fresh();
+    setActive(base.id);
+    await typeKeys('ls -la');
+    await api.smokeKeys([ENTER]);
+    const lsla = [...state.nodes.values()].pop();
+    await done(lsla);
+    await fresh();
+    await typeKeys('ls');
+    check('ghost: ls shows " -la" from this folder', await until(() => st().ghost === ' -la' && !!els.mirror.querySelector('.ghost')), st().ghost);
+    await api.smokeDone({ keep: true, suffix: 'ghost' });
+    await api.smokeKeys([key('Right')]);
+    check('ghost: → accepts it', await until(() => v() === 'ls -la'), v());
+    await fresh();
+    await typeKeys('git');
+    check('ghost: never offers a command not found', !(st().ghost || '').includes('gti'), st().ghost);
+    const nf = await run('loomnotacommand --x');
+    await fresh();
+    await typeKeys('loomnot');
+    await wait(100);
+    check('ghost: a command not found (127) is not suggested', nf.exitCode === 127 && !st().ghost, [nf.exitCode, st().ghost]);
+
+    // ---- Ctrl+R
+    await fresh();
+    await api.smokeKeys([key('R', 'control')]);
+    check('ctrl+r: opens history search', await until(() => !!st().search), st().search);
+    await typeKeys('chk');
+    const scopes = [st().search.scope];
+    let found = st().search.results[0] === 'git checkout feature';
+    for (let i = 0; i < 2 && !found; i++) {
+      await api.smokeKeys([key('R', 'control')]);
+      await wait(60);
+      scopes.push(st().search.scope);
+      found = st().search.results[0] === 'git checkout feature';
+    }
+    check('ctrl+r: chk finds git checkout feature', found, st().search);
+    console.log(`[e2e] INFO ctrl+r chk results: ${JSON.stringify(st().search.results.slice(0, 5))}`);
+    await api.smokeKeys([key('R', 'control')]);
+    scopes.push(st().search.scope);
+    check('ctrl+r: Ctrl+R again cycles This branch → This folder → All', scopes.join() === 'branch,folder,all,branch', scopes);
+    while (st().search.scope !== 'all') await api.smokeKeys([key('R', 'control')]);
+    await wait(80);
+    await api.smokeDone({ keep: true, suffix: 'search' });
+    before = cards();
+    await api.smokeKeys([ENTER]);
+    check("ctrl+r: Enter puts it in the bar and doesn't run it", await until(() => v() === 'git checkout feature' && !st().search) && cards() === before, [v(), cards() - before]);
+    await fresh();
+    await api.smokeKeys([key('R', 'control')]);
+    await typeKeys('ls -la');
+    while (st().search.scope !== 'all') await api.smokeKeys([key('R', 'control')]);
+    await wait(80);
+    check('ctrl+r: ls -la is the top result in All', st().search.results[0] === 'ls -la', st().search.results.slice(0, 3));
+    await api.smokeKeys([key('Return', 'shift')]);
+    check('ctrl+r: Shift+Enter runs it', await until(() => cards() === before + 1 && [...state.nodes.values()].pop().cmd === 'ls -la'), [...state.nodes.values()].pop().cmd);
+    await done([...state.nodes.values()].pop());
+    await fresh();
+    await api.smokeKeys([key('R', 'control')]);
+    await api.smokeKeys([ESC]);
+    check('ctrl+r: Esc cancels', await until(() => !st().search && document.activeElement === els.prompt), null);
+
+    // 20,000 records: rank time per keystroke.
+    const real = state.history;
+    const words = ['git', 'checkout', 'status', 'npm', 'run', 'build', 'docker', 'compose', 'up', 'kubectl', 'get', 'pods', 'grep', 'feature'];
+    state.history = [...real];
+    for (let i = 0; state.history.length < 20000; i++) state.history.unshift({ cmd: `${words[i % 14]} ${words[(i * 5) % 14]} ${words[(i * 3) % 14]} ${i}`, cwd: sys.home, exitCode: i % 7 ? 0 : 1, startedAt: Date.now() - i * 60000 });
+    await fresh();
+    await api.smokeKeys([key('R', 'control')]);
+    await wait(100);
+    let worst = 0;
+    const frames = [];
+    for (const ch of 'gitchk') {
+      const f0 = performance.now();
+      await api.smokeKeys([ch]);
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      frames.push(performance.now() - f0);
+      worst = Math.max(worst, st().lastSearch);
+    }
+    check('ctrl+r: 20,000 records rank in under 30 ms a keystroke', worst < 30, [worst.toFixed(1), frames.map((f) => f.toFixed(0))]);
+    await api.smokeKeys([ESC]);
+    state.history = real;
+
+    // ---- leading space stays out of history
+    await fresh();
+    await typeKeys(' echo secret-space');
+    await api.smokeKeys([ENTER]);
+    await until(() => [...state.nodes.values()].pop().cmd === 'echo secret-space');
+    const sec = [...state.nodes.values()].pop();
+    await done(sec);
+    check('ignorespace: the command ran', text(sec) === 'secret-space', text(sec));
+    const saved = await api.historyLoad();
+    check('ignorespace: not in history', !state.history.some((r) => r.cmd.includes('secret-space')) && !saved.some((r) => r.cmd.includes('secret-space')), null);
+    await fresh();
+    await typeKeys('echo sec');
+    check('ignorespace: no ghost text for it', !st().ghost, st().ghost);
+    const rec = saved.find((r) => r.cmd === 'ls -la');
+    check('history: records cwd, exit code, duration, branch', rec && rec.cwd === lsla.cwd && rec.exitCode === 0 && rec.durationMs >= 0 && rec.rootId === rootOf(lsla).id && rec.cardId === lsla.id, rec);
+
+    // ---- ask Claude
+    await fresh();
+    await api.smokeKeys([key('I', MODK)]);
+    check('⌘/Ctrl+I: switches to ask Claude', state.mode === 'ai' && /back to shell/.test(els.hint.textContent), [state.mode, els.hint.textContent]);
+    await api.smokeKeys([key('I', MODK)]);
+    check('⌘/Ctrl+I: and back', state.mode === 'shell', state.mode);
+    await api.smokeKeys([TAB]);
+    check("Tab doesn't switch modes any more", state.mode === 'shell', state.mode);
+    await fresh();
+    await typeKeys('?find big files');
+    await api.smokeKeys([ENTER]);
+    // No API key in the e2e run, so asking Claude opens Settings to add one.
+    check('?find big files still asks Claude', await until(() => $('#settings').open && /API key/.test($('#settings-note').textContent)), $('#settings-note').textContent);
+    $('#settings').close('cancel');
+    await fresh();
+  }
+
   // Second e2e phase: a new Loom process, over the session the first one saved.
   async function smokeResume({ run, text, check }) {
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    await wait(1500);
+    check('restart: no second import offer', ![...document.querySelectorAll('.toast')].some((t) => /zsh_history/.test(t.textContent)), null);
+    check('restart: history persisted', state.history.some((r) => r.cmd === 'ls -la' && r.exitCode === 0) && state.history.some((r) => r.cmd === 'git checkout feature'), state.history.length);
     const old = [...state.nodes.values()].find((n) => n.cmd.startsWith('export RESUME_VAR'));
     check('restart: card restored with its snapshot', old && old.envFile, old && old.envFile);
     const child = await run('echo "$RESUME_VAR"; pwd', old);

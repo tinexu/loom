@@ -21,20 +21,33 @@ ${shell === 'zsh'
 ${process.env.E2E_RC || ''}
 `;
 
+const HISTORY = {
+  zsh: ': 1700000000:0;git checkout feature\n: 1700000100:2;for f in *; do\\\n  echo $f\\\ndone\n: 1700000200:0;make deploy\n',
+  bash: '#1700000300\ncargo build --release\n',
+};
+const hash = (f) => require('crypto').createHash('sha1').update(fs.readFileSync(f)).digest('hex');
+
 function fixture(shell) {
   const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'loom e2e-'));
   const home = path.join(root, 'home');
-  const cwd = path.join(root, 'project');
+  const cwd = path.join(home, 'loom-demo');
   fs.mkdirSync(home);
   fs.mkdirSync(cwd);
   fs.writeFileSync(path.join(home, shell === 'zsh' ? '.zshrc' : '.bashrc'), RC(shell));
+  // Shell history to import: extended zsh format with a multi-line entry, and bash.
+  fs.writeFileSync(path.join(home, '.zsh_history'), HISTORY.zsh);
+  fs.writeFileSync(path.join(home, '.bash_history'), HISTORY.bash);
+  for (const d of ['src/lib', 'scripts']) fs.mkdirSync(path.join(cwd, d), { recursive: true });
+  fs.writeFileSync(path.join(cwd, 'my file.txt'), 'spaced\n');
   fs.writeFileSync(path.join(cwd, 'people.csv'), 'name,team,score\nalice,eng,100\ncarol,eng,300\nbob,ops,200\n');
   fs.writeFileSync(path.join(cwd, 'README.md'), Array.from({ length: 300 }, (_, i) => `line ${i + 1}`).join('\n'));
-  fs.writeFileSync(path.join(cwd, 'package.json'), '{"name":"fixture","version":"1.0.0"}\n');
+  fs.writeFileSync(path.join(cwd, 'package.json'), '{"name":"fixture","version":"1.0.0","scripts":{"build":"echo built","test":"echo tested"}}\n');
   const git = (...a) => spawnSync('git', ['-c', 'user.name=e2e', '-c', 'user.email=e2e@example.com', ...a], { cwd });
   git('init', '-q');
   git('add', '.');
   git('commit', '-qm', 'first');
+  git('branch', 'feature');
+  git('branch', 'fix-typo');
   return { root, home, cwd };
 }
 
@@ -82,11 +95,19 @@ function report(label, out) {
   let failed = 0;
   for (const shell of shells) {
     const fx = fixture(shell);
+    const histHash = ['.zsh_history', '.bash_history'].map((f) => hash(path.join(fx.home, f))).join();
     failed += report(shell, await launch(shell, fx, {}));
     failed += report(`${shell} (restart)`, await launch(shell, fx, { LOOM_SMOKE_RESUME: '1' }));
     const saved = fs.readFileSync(path.join(fx.root, 'userData', 'session.json'), 'utf8');
     if (saved.includes('loom-canary-hunter2')) { console.log(`${shell} FAIL typed secret found in session.json`); failed++; }
     else console.log(`${shell} PASS typed secret isn't in session.json`);
+    const hist = fs.readFileSync(path.join(fx.root, 'userData', 'history.jsonl'), 'utf8');
+    const histOk = !hist.includes('secret-space') && !hist.includes('loom-canary-hunter2') && hist.includes('"cmd":"ls -la"');
+    console.log(`${shell} ${histOk ? 'PASS' : 'FAIL'} history.jsonl has ls -la and no leading-space command or typed secret`);
+    if (!histOk) failed++;
+    const untouched = ['.zsh_history', '.bash_history'].map((f) => hash(path.join(fx.home, f))).join() === histHash;
+    console.log(`${shell} ${untouched ? 'PASS' : 'FAIL'} ~/.zsh_history and ~/.bash_history unchanged`);
+    if (!untouched) failed++;
     if (process.env.E2E_SHOTS) {
       fs.mkdirSync(process.env.E2E_SHOTS, { recursive: true });
       for (const f of fs.readdirSync(fx.root)) if (f.endsWith('.png')) fs.copyFileSync(path.join(fx.root, f), path.join(process.env.E2E_SHOTS, `${shell}-${f}`));
