@@ -1,0 +1,154 @@
+# Loom's packaging. `npm run dist` runs scripts/dist.js, which builds the
+# Finder helper, decides whether to sign, and runs electron-builder with this.
+appId: com.tinexu.loom
+productName: Loom
+copyright: Copyright © 2026 Loom contributors
+
+directories:
+  output: dist
+  buildResources: build
+
+# Only what the app runs. electron-builder adds the production dependencies
+# from node_modules; the patterns below keep their docs and tests out too.
+files:
+  - main.js
+  - preload.js
+  - package.json
+  - lib/**
+  - renderer/**
+  - themes/**
+  - "!**/.env"
+  - "!**/.env.*"
+  - "!**/*.log"
+  - "!**/*.png"
+  - "!**/test/**"
+  - "!**/tests/**"
+  - "!**/__tests__/**"
+  - "!**/*.map"
+  - "!**/*.md"
+  - "!**/docs/**"
+  - "!**/example/**"
+  - "!**/examples/**"
+  - "!renderer/bench.js"
+  - "!lib/package-check.js"
+  - "!node_modules/node-pty/deps/**"
+  - "!node_modules/node-pty/src/**"
+  - "!node_modules/node-pty/build/{deps,Release/obj.target,Release/.deps}/**"
+  - "!node_modules/node-pty/scripts/**"
+  - "!node_modules/node-pty/third_party/**"
+
+# node-pty's native module and its spawn-helper are loaded from disk.
+asarUnpack:
+  - node_modules/node-pty/**
+
+# The `loom` command lives inside the app (Contents/Resources/bin/loom, or
+# resources/bin/loom on Linux); "Install 'loom' command" links to it.
+extraResources:
+  - from: build/bin/loom
+    to: bin/loom
+  - from: build/icons/512x512.png
+    to: icons/loom.png
+
+# Platform files lists would replace the list above, so node-pty's binaries
+# for other systems and architectures are removed after packing instead.
+afterPack: build/after-pack.js
+
+# Rebuild node-pty for Electron on each platform's own runner.
+npmRebuild: true
+buildDependenciesFromSource: false
+
+protocols:
+  - name: Loom
+    schemes: [loom]
+
+mac:
+  category: public.app-category.developer-tools
+  icon: build/icon.icns
+  target:
+    - target: dmg
+    - target: zip
+  # scripts/dist.js turns these off for an unsigned build.
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  notarize: false
+  extendInfo:
+    # "Open With → Loom" and folders dropped on the Dock icon.
+    CFBundleDocumentTypes:
+      - CFBundleTypeName: Folder
+        CFBundleTypeRole: Viewer
+        LSHandlerRank: Alternate
+        LSItemContentTypes: [public.folder]
+    # Programs run in Loom's terminals ask for these on Loom's behalf.
+    NSAppleEventsUsageDescription: A program running in Loom wants to control another app.
+    NSDesktopFolderUsageDescription: A program running in Loom wants to use files on your Desktop.
+    NSDocumentsFolderUsageDescription: A program running in Loom wants to use files in your Documents folder.
+    NSDownloadsFolderUsageDescription: A program running in Loom wants to use files in your Downloads folder.
+    NSRemovableVolumesUsageDescription: A program running in Loom wants to use files on a removable drive.
+    NSNetworkVolumesUsageDescription: A program running in Loom wants to use files on a network volume.
+    NSCameraUsageDescription: A program running in Loom wants to use the camera.
+    NSMicrophoneUsageDescription: A program running in Loom wants to use the microphone.
+    NSAudioCaptureUsageDescription: A program running in Loom wants to record audio.
+    NSBluetoothAlwaysUsageDescription: A program running in Loom wants to use Bluetooth.
+    NSBluetoothPeripheralUsageDescription: A program running in Loom wants to use Bluetooth.
+
+dmg:
+  title: Loom ${version}
+  contents:
+    - x: 140
+      y: 190
+    - x: 420
+      y: 190
+      type: link
+      path: /Applications
+    - x: 280
+      y: 360
+      type: file
+      path: build/helper/Open in Loom.app
+  window:
+    width: 560
+    height: 470
+
+linux:
+  executableName: loom
+  icon: build/icons
+  category: System
+  synopsis: A spatial terminal
+  description: Every command becomes a card on an infinite canvas.
+  target:
+    - AppImage
+    - deb
+  desktop:
+    entry:
+      Name: Loom
+      GenericName: Terminal
+      Comment: A spatial terminal
+      Categories: System;TerminalEmulator;
+      MimeType: inode/directory;x-scheme-handler/loom;
+      StartupWMClass: Loom
+      Keywords: shell;prompt;command;commandline;terminal;
+
+deb:
+  afterInstall: build/linux/after-install.sh
+  afterRemove: build/linux/after-remove.sh
+  depends: [libgtk-3-0, libnotify4, libnss3, libxss1, libxtst6, xdg-utils, libatspi2.0-0, libuuid1, libsecret-1-0]
+
+appImage:
+  artifactName: Loom-${version}-${arch}.AppImage
+
+win:
+  icon: build/icon.ico
+  target:
+    - target: nsis
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+
+publish:
+  provider: github
+  owner: tinexu
+  repo: loom
+  releaseType: draft

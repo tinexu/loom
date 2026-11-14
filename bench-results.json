@@ -174,6 +174,114 @@
         },
         "peakMB": 682.484375
       }
+    },
+    {
+      "label": "tabs",
+      "date": "2026-11-08T22:47:52.106Z",
+      "commit": "7385aee+dirty",
+      "machine": "Apple M3 Pro, 18 GB, darwin",
+      "results": {
+        "stream": {
+          "idleMainMB": 173.125,
+          "idleRendererMB": 129.4375,
+          "idleAllMB": 455.015625,
+          "seq": {
+            "ms": 4187.800000071526,
+            "status": "ok",
+            "bytes": 30666660,
+            "lines": 3000001,
+            "longTasks": 0,
+            "maxLongTask": 0,
+            "keyP95": 8.000000047683898,
+            "keys": 29,
+            "tasks": [],
+            "mainMB": 193,
+            "rendererMB": 241,
+            "heapMB": 23
+          },
+          "yes": {
+            "ms": 4641.299999952316,
+            "status": "ok",
+            "bytes": 201000000,
+            "lines": 1000000,
+            "longTasks": 0,
+            "maxLongTask": 0,
+            "keyP95": 8.199999976157414,
+            "keys": 32,
+            "tasks": [],
+            "mainMB": 240,
+            "rendererMB": 287,
+            "heapMB": 23
+          },
+          "gb": {
+            "ms": 25744.399999976158,
+            "status": "ok",
+            "bytes": 1073741824,
+            "lines": 10737419,
+            "longTasks": 0,
+            "maxLongTask": 0,
+            "keyP95": 7.400000000001455,
+            "keys": 185,
+            "tasks": [],
+            "mainMB": 290,
+            "rendererMB": 303,
+            "heapMB": 23
+          },
+          "peakMainMB": 289.6875,
+          "peakRendererMB": 303.421875,
+          "peakAllMB": 713.484375
+        },
+        "first": {
+          "firstPaint": 824,
+          "cards": 1000,
+          "bodies": 843,
+          "idle": 824,
+          "peakMainMB": 227.59375,
+          "peakRendererMB": 149.0625,
+          "peakAllMB": 522.109375
+        },
+        "startup": {
+          "firstPaint": 388,
+          "cards": 1000,
+          "bodies": 412,
+          "idle": 388,
+          "pan": {
+            "fps": 120.00480019200768,
+            "p95": 9.200000000000045,
+            "frames": 300,
+            "slow": 0
+          },
+          "zoom": {
+            "fps": 119.66040510729327,
+            "p95": 9.300000000000182,
+            "frames": 358,
+            "slow": 0
+          },
+          "far": {
+            "fps": 120.45169385194474,
+            "p95": 9.200000000000728,
+            "frames": 240,
+            "slow": 0
+          },
+          "mapOpen": 27.699999928474426,
+          "mapFilter": 11.5,
+          "peakMainMB": 190.28125,
+          "peakRendererMB": 221.046875,
+          "peakAllMB": 526.03125,
+          "sessionMB": 0.42991161346435547
+        },
+        "map": {
+          "firstPaint": 651,
+          "cards": 20000,
+          "mapOpen": 31.200000047683716,
+          "mapFilter": 18,
+          "mapScroll": 8.146666665871939,
+          "peakMainMB": 236.375,
+          "peakRendererMB": 325.296875,
+          "peakAllMB": 712.140625
+        },
+        "peakMB": 593.109375
+      }
     }
   ]
 }

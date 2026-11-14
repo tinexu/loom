@@ -6,7 +6,7 @@
 (function () {
   const { ShellLex, Fuzzy } = window;
 
-  const LINE = 20; // px, matches styles.css
+  const LINE = 20; // px, when the font settings haven't set --bar-lh
   const MAX_LINES = 10;
   // Known even before the shell has answered, so `cd` is never red.
   const BASICS = new Set(['cd', 'echo', 'export', 'source', '.', 'alias', 'unalias', 'unset', 'set', 'exit', 'return', 'eval', 'exec',
@@ -160,7 +160,8 @@
 
     function autosize() {
       ta.style.height = 'auto';
-      const h = Math.min(ta.scrollHeight, MAX_LINES * LINE + 12);
+      const line = parseFloat(getComputedStyle(ta).lineHeight) || LINE;
+      const h = Math.min(ta.scrollHeight, MAX_LINES * line + 12);
       ta.style.height = `${h}px`;
       mirror.style.height = `${h}px`;
       mirror.scrollTop = ta.scrollTop;
@@ -431,11 +432,11 @@
         if (k === 'ArrowLeft' || k === 'ArrowRight' || k === 'Home' || k === 'End') closePopup();
       }
 
-      if (k === 'Tab') {
-        if (shell && !e.shiftKey && !mod && !e.altKey) requestCompletion({ tab: true });
+      // Ctrl+Tab and friends are commands (tabs); plain Tab never leaves the bar.
+      if (k === 'Tab' && !mod && !e.altKey) {
+        if (shell && !e.shiftKey) requestCompletion({ tab: true });
         return take(); // never tab out of the bar
       }
-      if (k === 'r' && e.ctrlKey && !e.metaKey && !e.altKey) { openSearch(); return take(); }
 
       const v = ta.value;
       const s = ta.selectionStart;

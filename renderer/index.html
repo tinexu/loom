@@ -10,9 +10,11 @@
 </head>
 <body>
   <header id="topbar">
-    <div class="brand"><span class="logo"></span>Loom</div>
-    <button class="tb" id="btn-map" title="History map (⌘/Ctrl+B)">Map</button>
+    <div class="brand"><span class="logo"></span><span class="brand-name">Loom</span></div>
+    <button class="tb" id="btn-map" title="History map">Map</button>
+    <div id="tabs"></div>
     <div class="spacer"></div>
+    <button class="tb icon" id="btn-pin" title="Keep the dropdown open" hidden>📌</button>
     <button class="tb" id="btn-newroot" title="New root (⌘/Ctrl+N)">New root</button>
     <div class="zoom">
       <button class="tb icon" id="btn-zoomout" title="Zoom out">−</button>
@@ -20,6 +22,7 @@
       <button class="tb icon" id="btn-zoomin" title="Zoom in">+</button>
     </div>
     <button class="tb" id="btn-fit" title="Fit everything (⌘/Ctrl+0)">Fit</button>
+    <button class="tb" id="btn-palette" title="Command palette">⌘</button>
     <button class="tb" id="btn-settings" title="Settings">Settings</button>
   </header>
 
@@ -39,7 +42,7 @@
     <div id="empty" hidden>
       <div class="empty-title">A terminal you can see.</div>
       <div class="empty-sub">Every command becomes a card. Branch from any card, pipe one card into another, and ask Claude when you don't remember the flags.</div>
-      <div class="empty-keys"><kbd>Tab</kbd> completes · <kbd>Ctrl</kbd><kbd>R</kbd> searches history · <kbd class="mod-key">⌘</kbd><kbd>I</kbd> or <kbd>?</kbd> asks Claude</div>
+      <div class="empty-keys"><kbd>Tab</kbd> completes · <kbd>Ctrl</kbd><kbd>R</kbd> searches history · <kbd class="mod-key">⌘</kbd><kbd>I</kbd> or <kbd>?</kbd> asks Claude · <kbd class="mod-key">⌘</kbd><kbd>⇧</kbd><kbd>P</kbd> every command</div>
       <div class="empty-chips">
         <button class="chip" data-cmd="ls">ls</button>
         <button class="chip" data-cmd="git log">git log</button>
@@ -79,40 +82,18 @@
 
   <div id="toasts"></div>
 
-  <dialog id="settings">
-    <form method="dialog" id="settings-form">
-      <h2>Settings</h2>
-      <p class="muted" id="settings-note"></p>
-      <label>Anthropic API key
-        <input id="set-key" type="password" autocomplete="off" spellcheck="false">
-      </label>
-      <div class="row-actions"><button type="button" class="linkish" id="set-key-remove">Remove saved key</button></div>
-      <div class="row-actions"><button type="button" class="linkish" id="set-import">Import ~/.zsh_history and ~/.bash_history</button>
-        <span class="muted small">Read only. Loom never writes to them.</span></div>
-      <label>Model
-        <input id="set-model" spellcheck="false">
-      </label>
-      <label class="check"><input type="checkbox" id="set-color"> Force color output
-        <span class="muted">Shell sessions already run on a terminal, so this only affects the plain-pipe fallback. Can break in-command pipes like <code>git branch | xargs</code>.</span>
-      </label>
-      <label class="check"><input type="checkbox" id="set-pager"> Use a real pager
-        <span class="muted">Commands like <code>git log</code> open your pager in a live terminal, and don't get rich views or finished cards until you quit it.</span>
-      </label>
-      <div class="row-2">
-        <label>Output per card (GB)
-          <input id="set-cap" type="number" min="0.01" step="any">
-        </label>
-        <label>Output for all cards (GB)
-          <input id="set-total" type="number" min="0.01" step="any">
-        </label>
-      </div>
-      <p class="muted small">Past the first, a card stops recording (the command keeps running). Past the second, the oldest cards' output is removed.</p>
-      <p class="muted small" id="set-shell"></p>
+  <div id="settings-view" hidden></div>
+  <div id="palette" hidden></div>
+
+  <dialog id="confirm">
+    <form method="dialog">
+      <h2 class="cf-title"></h2>
+      <p class="muted cf-body"></p>
+      <ul class="cf-list"></ul>
       <div class="dialog-actions">
-        <button type="button" class="danger" id="set-clear">Clear canvas</button>
         <div class="spacer"></div>
         <button value="cancel" formnovalidate>Cancel</button>
-        <button value="save" class="primary" id="set-save">Save</button>
+        <button value="ok" class="danger cf-ok">OK</button>
       </div>
     </form>
   </dialog>
@@ -123,16 +104,20 @@
   <script src="vendor/addon-unicode11.js"></script>
   <script src="vendor/addon-web-links.js"></script>
   <script src="vendor/addon-search.js"></script>
+  <script src="keys.js"></script>
   <script src="wrap.js"></script>
   <script src="spatial.js"></script>
   <script src="shell-lex.js"></script>
   <script src="fuzzy.js"></script>
   <script src="ansi.js"></script>
+  <script src="theme.js"></script>
   <script src="views.js"></script>
   <script src="vlines.js"></script>
   <script src="terminals.js"></script>
   <script src="editor.js"></script>
-  <script src="bench.js"></script>
+  <script src="commands.js"></script>
+  <script src="tabbar.js"></script>
+  <script src="settings-page.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

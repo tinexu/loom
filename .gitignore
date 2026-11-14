@@ -37,3 +37,6 @@ Thumbs.db
 !.vscode/extensions.json
 *.swp
 *~
+# Build inputs that are images; the compiled Finder helper is generated
+!build/**/*.png
+build/helper/

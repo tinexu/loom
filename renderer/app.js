@@ -16,7 +16,7 @@
   const GAP_Y = 64;
   const ANCHOR = 23; // x offset of the status dot, where edges attach
   const LIVE_DELAY = 150; // quick commands finish before they'd need a terminal
-  const LINE_H = 19; // card output rows
+  let LINE_H = 19; // card output rows, from the font settings
   const HEAD_H = 62; // a card's header and sub-header
   const PILL_K = 0.55; // below this zoom, cards are pills
   const FAR_K = 0.25; // below this, cards are drawn on one canvas
@@ -36,17 +36,24 @@
     zoomLabel: $('#zoom-label'), toasts: $('#toasts'),
   };
 
+  // ================================================================ canvases
+  // Each tab is a canvas: its cards, view, active card and root folder. `cur`
+  // is the one on screen, and state.nodes, state.view and the rest are its.
+  const canvases = new Map(); // canvas id -> canvas
+  const blankCanvas = (meta) => ({
+    id: meta.id, title: meta.title || 'Home', color: meta.color || null, folder: meta.folder || null,
+    loaded: false, loading: null, nodes: new Map(), nextId: 1, view: { x: 120, y: 90, k: 1 }, activeId: null,
+    rootCwd: meta.folder || sys.home, pipeFrom: null, sidebar: false, sent: new Map(), sentMeta: '', unseen: null,
+  });
+  let cur = { ...blankCanvas({ id: 'none' }), loaded: true };
   const state = {
-    nodes: new Map(),
-    nextId: 1,
-    view: { x: 120, y: 90, k: 1 },
-    activeId: null,
-    rootCwd: sys.home,
-    pipeFrom: null,
     mode: 'shell',
     history: [], // records from main.js, oldest first
     suggestion: null,
   };
+  for (const k of ['nodes', 'nextId', 'view', 'activeId', 'rootCwd', 'pipeFrom']) {
+    Object.defineProperty(state, k, { get: () => cur[k], set: (v) => { cur[k] = v; }, enumerable: true });
+  }
   // node id -> { card, mode: 'stub' | 'pill' | 'full', ...refs of a full card }
   const dom = new Map();
   const running = new Set();
@@ -58,7 +65,7 @@
     overlay: $('#term-overlay'),
     slot: $('#term-slot'),
     rect: cardBodyRect,
-    onChange: (n) => { if (state.nodes.has(n.id)) { updateCard(n); schedule(n); } },
+    onChange: (n) => { if (state.nodes.get(n.id) === n) { updateCard(n); schedule(n); } },
     onOutput: (n) => schedule(n),
     onAlt(n, entered) {
       if (!entered) { terminals.collapse(); return; }
@@ -66,6 +73,8 @@
     },
     onRelease: () => focusPrompt(),
     onPointer: (n) => { if (n.id !== state.activeId) setActive(n.id); showTerm(n, { focus: true }); },
+    font: () => (window.Theme.fonts() ? window.Theme.fonts().size : 12),
+    settings: () => settingsNow,
   });
 
   // Where a card's body is on screen, for the live terminal laid over it.
@@ -86,7 +95,7 @@
   // A running card needs a terminal model to show or take input.
   function showTerm(n, o) {
     if (n.status !== 'running' || n.ending) return;
-    if (!terminals.has(n.id)) terminals.attach(n);
+    if (!terminals.has(n.key)) terminals.attach(n);
     terminals.show(n, o);
   }
 
@@ -257,8 +266,9 @@
 
   // ================================================================ cards
   function makeNode(props) {
+    const id = state.nextId++;
     const n = {
-      id: state.nextId++, cmd: '', cwd: sys.home, cwdAfter: null, parentId: null, pipeFrom: null,
+      id, key: `${cur.id}.${id}`, cmd: '', cwd: sys.home, cwdAfter: null, parentId: null, pipeFrom: null,
       x: 0, y: 0, w: CARD_W, bodyH: 300, h: HEAD_H + 40, status: 'running', exitCode: null,
       startedAt: Date.now(), endedAt: null, rich: null, richKind: null, view: 'rich', ai: null, collapsed: false,
       killed: false, envFile: null, out: null, capped: false,
@@ -363,7 +373,7 @@
     const d = dom.get(n.id);
     if (!d) return;
     const c = d.card;
-    const live = terminals.isLive(n.id);
+    const live = terminals.isLive(n.key);
     c.className = `card ${d.mode}${d.mode === 'full' ? '' : ''} s-${n.status}${n.id === state.activeId ? ' active' : ''}${n.collapsed ? ' collapsed' : ''}${n.pipeFrom != null ? ' piped' : ''}${live ? ' has-live' : ''}`;
     c.style.left = `${n.x}px`;
     c.style.top = `${n.y}px`;
@@ -484,7 +494,7 @@
       body.className = 'card-body raw vtbody';
       body.textContent = '';
       d.vt = VLines.create({
-        api, id: n.id, host: body, lineH: LINE_H,
+        api, id: n.key, host: body, lineH: LINE_H,
         maxHeight: () => n.bodyH - 22,
         onLayout: () => release(n),
         atEnd: !!n.vtAtEnd, top: n.vtTop || 0,
@@ -497,7 +507,7 @@
   async function loadInfo(n) {
     if (n.infoLoading) return;
     n.infoLoading = true;
-    try { n.out = await api.outInfo(n.id); } finally { n.infoLoading = false; }
+    try { n.out = await api.outInfo(n.key); } finally { n.infoLoading = false; }
     if (n.out && n.out.capped) n.capped = true;
     if (state.nodes.has(n.id)) { updateCard(n); schedule(n); }
   }
@@ -506,7 +516,7 @@
     if (n.richLoading) return;
     n.richLoading = true;
     try {
-      const rich = await worker.call('restore', { id: n.id, kind: n.richKind, cmd: n.cmd, cwd: n.cwd, cwdAfter: n.cwdAfter });
+      const rich = await worker.call('restore', { id: n.key, kind: n.richKind, cmd: n.cmd, cwd: n.cwd, cwdAfter: n.cwdAfter });
       if (!state.nodes.has(n.id)) return;
       if (rich) n.rich = rich; else { n.richKind = null; }
     } catch (err) { console.warn('rich view failed', err); n.richKind = null; } finally { n.richLoading = false; }
@@ -693,7 +703,7 @@
     for (const [id, d] of dom) {
       if (d.mode === 'stub') continue;
       const n = state.nodes.get(id);
-      const pinned = d.mode === 'full' && (terminals.isLive(id) || terminals.isFocused(id) || (d.body && d.body.contains(document.activeElement)));
+      const pinned = d.mode === 'full' && (terminals.isLive(n.key) || terminals.isFocused(n.key) || (d.body && d.body.contains(document.activeElement)));
       if ((!keep.has(id) && !pinned) || (d.mode !== mode && !pinned)) unmount(n);
     }
     const cx = r.x + r.w / 2; const cy = r.y + r.h / 2;
@@ -716,13 +726,13 @@
       if (!n || n.ending) continue;
       const d = dom.get(id);
       const onScreen = d && d.mode === 'full' && n.x < r.x + r.w && n.x + n.w > r.x && n.y < r.y + r.h && n.y + h(n) > r.y;
-      const need = onScreen || n.justRun || terminals.isLive(id) || terminals.stats().overlay === id || terminals.inAlt(id);
+      const need = onScreen || n.justRun || terminals.isLive(n.key) || terminals.stats().overlay === n.key || terminals.inAlt(n.key);
       if (need) {
         n.releaseAt = 0;
-        if (!terminals.has(id)) terminals.attach(n);
-      } else if (terminals.has(id)) {
+        if (!terminals.has(n.key)) terminals.attach(n);
+      } else if (terminals.has(n.key)) {
         if (!n.releaseAt) { n.releaseAt = now + MODEL_GRACE; setTimeout(scheduleLayout, MODEL_GRACE + 20); }
-        else if (now >= n.releaseAt) { n.releaseAt = 0; terminals.release(id); schedule(n); }
+        else if (now >= n.releaseAt) { n.releaseAt = 0; terminals.release(n.key); schedule(n); }
       }
     }
   }
@@ -1129,17 +1139,17 @@
       case 'pipe': setActive(n.id); setPipe(n.id); focusPrompt(); break;
       case 'explain': explain(n); break;
       case 'copy': {
-        const res = await api.outCopy({ id: n.id });
+        const res = await api.outCopy({ id: n.key });
         toast(res && res.truncated ? `Copied the first ${fmtBytes(res.bytes)}. Save output… keeps all of it.` : 'Output copied', { timeout: res && res.truncated ? 5000 : 1600 });
         break;
       }
       case 'save': {
-        const res = await api.outSave({ id: n.id, name: n.cmd });
+        const res = await api.outSave({ id: n.key, name: n.cmd });
         if (res) toast(`Saved ${fmtBytes(res.bytes).replace(/^0 MB$/, 'output')} to ${tilde(res.path)}`, { timeout: 3000 });
         break;
       }
       case 'open': {
-        const err = await api.outOpen({ id: n.id });
+        const err = await api.outOpen({ id: n.key });
         if (err) toast(`Couldn't open: ${err}`, { kind: 'err' });
         break;
       }
@@ -1151,7 +1161,7 @@
   function stop(n) {
     if (n.status !== 'running') return;
     n.killed = true;
-    api.kill(n.id);
+    api.kill(n.key);
   }
 
   function dropRich(n) {
@@ -1172,9 +1182,9 @@
     layoutVersion++;
     treeVersion++;
     dropRich(n);
-    terminals.dispose(n.id);
-    VLines.forget(n.id);
-    api.forget(n.id);
+    terminals.dispose(n.key);
+    VLines.forget(n.key);
+    api.forget(n.key);
     dom.get(n.id).card.remove();
     dom.delete(n.id);
     inDom.delete(n.id);
@@ -1214,18 +1224,19 @@
     });
     const d = dom.get(n.id);
     if (d && d.vt) { d.vt.destroy(); d.vt = null; }
-    VLines.forget(n.id);
+    VLines.forget(n.key);
     running.add(n.id);
     terminals.attach(n, { fresh: true });
     recordStart(n);
+    renderTabBar();
     const src = n.pipeFrom != null ? state.nodes.get(n.pipeFrom) : null;
     if (n.pipeFrom != null && !src) { n.pipeFrom = null; syncEdges(n); }
     updateCard(n);
     schedule(n);
     const parent = state.nodes.get(n.parentId);
     api.run({
-      id: n.id, command: n.cmd, cwd: n.cwd, stdinFrom: src ? src.id : undefined,
-      parentId: parent ? parent.id : null,
+      id: n.key, command: n.cmd, cwd: n.cwd, stdinFrom: src ? src.key : undefined,
+      parentId: parent ? parent.key : null,
       fork: !!parent && childrenOf(parent.id).some((c) => c.id !== n.id),
       envFile: nearestSnapshot(parent),
       watch: true,
@@ -1240,19 +1251,31 @@
 
   api.onData(({ id, data }) => terminals.write(id, data));
 
-  api.onExit(async ({ id, code, signal, cwd, envFile, out }) => {
-    const n = state.nodes.get(id);
+  // A card's key is "<canvas>.<card>". Cards in background tabs keep running;
+  // their data changes here and their DOM is built when the tab is shown.
+  const canvasOf = (key) => canvases.get(String(key).split('.')[0]);
+  function nodeOf(key) {
+    const cv = canvasOf(key);
+    return cv && cv.nodes ? cv.nodes.get(Number(String(key).split('.')[1])) : null;
+  }
+
+  api.onExit(async ({ id: key, code, signal, cwd, envFile, out }) => {
+    const cv = canvasOf(key);
+    const n = nodeOf(key);
     if (!n) return;
     n.ending = true; // no new terminal model while it finishes
     const ended = await terminals.finish(n, { moved: !!(out && out.moved) });
-    if (!state.nodes.has(id)) return;
+    if (cv.nodes.get(n.id) !== n) return;
     // A program that moved the cursor keeps what its screen showed.
-    n.out = ended.text != null ? await api.outReplace({ id, text: ended.text }) : out;
-    if (!state.nodes.has(id)) return;
-    running.delete(id);
-    VLines.forget(id);
-    const d = dom.get(id);
-    if (d && d.vt) { d.vt.destroy(); d.vt = null; }
+    n.out = ended.text != null ? await api.outReplace({ id: key, text: ended.text }) : out;
+    if (cv.nodes.get(n.id) !== n) return;
+    const shown = cv === cur;
+    VLines.forget(key);
+    if (shown) {
+      running.delete(n.id);
+      const d = dom.get(n.id);
+      if (d && d.vt) { d.vt.destroy(); d.vt = null; }
+    }
     n.exitCode = code;
     n.endedAt = Date.now();
     n.cwdAfter = cwd;
@@ -1261,40 +1284,43 @@
     n.vtAtEnd = true;
     // 130 is Ctrl+C, typed into the live terminal or sent by Stop.
     n.status = n.killed || signal || code === 130 ? 'killed' : code === 0 ? 'ok' : 'error';
-    if (ended.focused) focusPrompt();
+    if (shown && ended.focused) focusPrompt();
     recordEnd(n);
-    updateCard(n);
-    schedule(n);
-    layoutVersion++;
-    if (id === state.activeId) { updateComposer(); editor.refreshInfo(); }
+    if (shown) {
+      updateCard(n);
+      schedule(n);
+      layoutVersion++;
+      if (n.id === state.activeId) { updateComposer(); editor.refreshInfo(); }
+    }
+    cardFinished(cv, n);
     if (n.status === 'ok') {
       try {
-        const rich = await worker.call('detect', { id, cmd: n.cmd, cwd: n.cwd, cwdAfter: n.cwdAfter });
-        if (rich && state.nodes.has(id) && n.status === 'ok') {
+        const rich = await worker.call('detect', { id: key, cmd: n.cmd, cwd: n.cwd, cwdAfter: n.cwdAfter });
+        if (rich && cv.nodes.get(n.id) === n && n.status === 'ok') {
           n.rich = rich;
           n.richKind = rich.kind;
-          renderTabs(n);
-          schedule(n);
+          if (cv === cur) { renderTabs(n); schedule(n); }
         }
       } catch (err) { console.warn('rich view failed', err); }
     }
-    saveSoon();
+    saveSoon(cv);
   });
 
-  api.onCapped(({ id, cap }) => {
-    const n = state.nodes.get(id);
+  api.onCapped(({ id: key, cap }) => {
+    const n = nodeOf(key);
     if (!n) return;
     n.capped = true;
     n.capCard = cap;
-    toast(`#${id} passed ${fmtBytes(cap)} of output. Loom stopped recording it; the command keeps running.`, { timeout: 6000 });
-    updateCard(n);
+    toast(`#${n.id} passed ${fmtBytes(cap)} of output. Loom stopped recording it; the command keeps running.`, { timeout: 6000 });
+    if (canvasOf(key) === cur) updateCard(n);
   });
-  api.onEvicted(({ id }) => {
-    const n = state.nodes.get(id);
+  api.onEvicted(({ id: key }) => {
+    const n = nodeOf(key);
     if (!n) return;
     n.out = { evicted: true, lines: 0, bytes: 0 };
-    VLines.forget(id);
-    const d = dom.get(id);
+    VLines.forget(key);
+    if (canvasOf(key) !== cur) return;
+    const d = dom.get(n.id);
     if (d && d.vt) { d.vt.destroy(); d.vt = null; }
     updateCard(n);
     schedule(n);
@@ -1355,7 +1381,7 @@
         n.justRun = false;
         if (n.status !== 'running' || state.activeId !== n.id) return;
         showTerm(n, { focus: takeKeyboard && composerIdle() });
-        if (terminals.inAlt(n.id) && !n.noExpand) terminals.expand(n);
+        if (terminals.inAlt(n.key) && !n.noExpand) terminals.expand(n);
       }, LIVE_DELAY);
     }
     updateComposer();
@@ -1407,7 +1433,7 @@
 
   // A new running card takes the keyboard, so sudo and REPLs work straight away,
   // unless the user has already started typing something else.
-  const composerIdle = () => !els.prompt.value.trim() && !state.suggestion && !$('#settings').open && !editor.busy();
+  const composerIdle = () => !els.prompt.value.trim() && !state.suggestion && settingsView.hidden && !palette.isOpen() && !editor.busy();
   // ---------------------------------------------------------------- history
   // A record is in memory as soon as the command starts, so ↑ finds it, and is
   // saved by main.js when it ends, with its exit code.
@@ -1419,7 +1445,7 @@
   function recordStart(n) {
     n.histRec = null;
     if (n.noHistory) return;
-    const rec = { cmd: n.cmd, cwd: n.cwd, exitCode: null, startedAt: n.startedAt, durationMs: null, rootId: rootOf(n).id, cardId: n.id };
+    const rec = { cmd: n.cmd, cwd: n.cwd, exitCode: null, startedAt: n.startedAt, durationMs: null, rootId: rootOf(n).key, cardId: n.key };
     const H = state.history;
     if (H.length && H[H.length - 1].cmd === rec.cmd) H[H.length - 1] = rec;
     else H.push(rec);
@@ -1448,7 +1474,7 @@
   function editorContext() {
     const a = state.nodes.get(state.activeId);
     const root = a ? rootOf(a) : null;
-    return { cwd: currentCwd(), cardId: a ? a.id : null, envFile: nearestSnapshot(a), rootId: root ? root.id : null };
+    return { cwd: currentCwd(), cardId: a ? a.key : null, envFile: nearestSnapshot(a), rootId: root ? root.key : null };
   }
 
   const editor = window.Editor.create({
@@ -1473,7 +1499,7 @@
     if (els.prompt.value || !n || n.status !== 'running' || !n.justRun) return false;
     if (e.ctrlKey || e.metaKey || e.altKey || (e.key.length > 1 && e.key !== 'Enter')) return false;
     e.preventDefault();
-    api.stdin({ id: n.id, data: e.key === 'Enter' ? '\r' : e.key });
+    api.stdin({ id: n.key, data: e.key === 'Enter' ? '\r' : e.key });
     terminals.show(n, { focus: true });
     return true;
   }
@@ -1488,16 +1514,13 @@
     setPipe(null);
   }
 
+  // The command bar's keys: a new card's typeahead, then the editor (popup,
+  // ghost text, history), then commands, then Enter.
   els.prompt.addEventListener('keydown', (e) => {
     if (forwardTypeahead(e)) return;
     if (editor.handleKey(e)) return;
+    if (registry.handle(e)) return;
     const v = els.prompt.value;
-    const mod = e.metaKey || e.ctrlKey;
-    if (mod && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'i') {
-      e.preventDefault();
-      setMode(state.mode === 'ai' ? 'shell' : 'ai');
-      return;
-    }
     if (e.key === 'Enter' && !e.isComposing) {
       // Shift+Enter, or an unfinished command (open quote, trailing |, heredoc…), adds a line.
       e.preventDefault();
@@ -1505,24 +1528,6 @@
       if (!v.trim()) return;
       editor.clear();
       submit(v);
-      return;
-    }
-    if (e.key === 'Escape') {
-      if (state.suggestion) hideSuggestion();
-      else if (state.pipeFrom != null) setPipe(null);
-      else if (v) editor.clear();
-      else els.prompt.blur();
-      return;
-    }
-    if (e.key === 'c' && e.ctrlKey && !e.metaKey && els.prompt.selectionStart === els.prompt.selectionEnd) {
-      const a = state.nodes.get(state.activeId);
-      if (a && a.status === 'running') { e.preventDefault(); stop(a); }
-      else if (v) { e.preventDefault(); editor.clear(); }
-      return;
-    }
-    if (e.key === 'd' && e.ctrlKey && !v) {
-      const a = state.nodes.get(state.activeId);
-      if (a && a.status === 'running') { e.preventDefault(); api.stdin({ id: a.id, eof: true }); }
     }
   });
 
@@ -1550,7 +1555,7 @@ Respond with only a JSON object (no prose, no code fences):
     const src = state.nodes.get(state.pipeFrom);
     let prompt = `OS: ${OS_NAME}\nShell: ${sys.shell}\nCurrent directory: ${cwd}\nEntries here: ${names.join(', ') || '(empty)'}\nRecent commands on this branch, oldest first:\n${branch.join('\n') || '(none)'}\n`;
     if (src) {
-      const { text: sample } = await api.outHead({ id: src.id, lines: 30 });
+      const { text: sample } = await api.outHead({ id: src.key, lines: 30 });
       prompt += `\nThe command will receive the output of \`${src.cmd}\` on stdin, so it should read from stdin rather than re-running that command. First lines of that output:\n${sample}\n`;
     }
     prompt += `\nRequest: ${text}`;
@@ -1669,7 +1674,7 @@ Respond with only a JSON object (no prose, no code fences):
     renderAi(n);
     scheduleLayout();
     // Main sends the head and tail; a huge output never comes to the page.
-    const { text: clipped } = await api.outClip({ id: n.id, head: 4000, tail: 8000 });
+    const { text: clipped } = await api.outClip({ id: n.key, head: 4000, tail: 8000 });
     const src = state.nodes.get(n.pipeFrom);
     const prompt = `OS: ${OS_NAME}\nShell: ${sys.shell}\nDirectory: ${n.cwd}\nCommand: ${n.cmd}\n${src ? `(stdin was the output of: ${src.cmd})\n` : ''}Exit code: ${n.exitCode ?? 'still running'}\n\nOutput:\n${clipped || '(no output)'}`;
     const res = await api.ai({ system: EXPLAIN_SYSTEM, prompt, maxTokens: 700 });
@@ -1853,58 +1858,436 @@ Respond with only a JSON object (no prose, no code fences):
     els.minimap.addEventListener('pointerup', up);
   });
 
-  // ================================================================ settings
-  const dlg = $('#settings');
-  async function openSettings(note = '') {
-    const s = await api.getSettings();
-    $('#settings-note').textContent = note;
-    $('#settings-note').hidden = !note;
-    $('#set-key').value = '';
-    $('#set-key').placeholder = s.keyFromEnv ? 'Using ANTHROPIC_API_KEY from the environment' : s.hasKey ? 'Saved · leave blank to keep' : 'sk-ant-…';
-    $('#set-key-remove').hidden = !s.hasKey || s.keyFromEnv;
-    $('#set-model').value = s.model;
-    $('#set-color').checked = s.forceColor;
-    $('#set-pager').checked = s.realPager;
-    $('#set-cap').value = s.outputCapGB;
-    $('#set-total').value = s.outputTotalGB;
-    $('#set-shell').textContent = `Shell: ${s.shell}. Keys are stored with your OS keychain encryption when available.`;
-    if (!dlg.open) dlg.showModal();
-    if (note) $('#set-key').focus();
+  // ================================================================ dialogs
+  // A confirmation listing what would be lost. Resolves true for OK.
+  function confirmDialog({ title, body = '', items = [], ok = 'OK' }) {
+    const d = $('#confirm');
+    d.querySelector('.cf-title').textContent = title;
+    d.querySelector('.cf-body').textContent = body;
+    const list = d.querySelector('.cf-list');
+    list.replaceChildren(...items.slice(0, 12).map((t) => { const li = document.createElement('li'); li.textContent = t; return li; }));
+    if (items.length > 12) { const li = document.createElement('li'); li.textContent = `…and ${items.length - 12} more`; list.append(li); }
+    d.querySelector('.cf-ok').textContent = ok;
+    return new Promise((resolve) => {
+      const done = () => { d.removeEventListener('close', done); resolve(d.returnValue === 'ok'); focusPrompt(); };
+      d.addEventListener('close', done);
+      d.returnValue = 'cancel';
+      d.showModal();
+      d.querySelector('.cf-ok').focus();
+    });
   }
-  dlg.addEventListener('close', async () => {
-    if (dlg.returnValue !== 'save') return;
-    const patch = {
-      model: $('#set-model').value, forceColor: $('#set-color').checked, realPager: $('#set-pager').checked,
-      outputCapGB: Number($('#set-cap').value), outputTotalGB: Number($('#set-total').value),
-    };
-    if ($('#set-key').value.trim()) patch.apiKey = $('#set-key').value.trim();
-    await api.setSettings(patch);
-    toast('Settings saved', { timeout: 1600 });
+
+  function clearCanvas() {
+    confirmDialog({ title: 'Clear this tab’s canvas?', body: 'Every card goes, with its output. Running commands are stopped.', ok: 'Clear canvas' }).then((yes) => {
+      if (!yes) return;
+      for (const n of [...state.nodes.values()]) { if (n.status === 'running') stop(n); terminals.dispose(n.key); VLines.forget(n.key); api.forget(n.key); dropRich(n); }
+      teardown();
+      state.nodes.clear();
+      state.activeId = null;
+      state.pipeFrom = null;
+      buildCanvas();
+      animateTo({ x: 120, y: 90, k: 1 });
+      saveSoon();
+    });
+  }
+
+  // ================================================================ tabs
+  // Each tab is a canvas. Only the one on screen has DOM; switching tears it
+  // down and builds the other from its data. Background tabs keep running.
+  let order = [];
+  const tabMeta = (cv) => ({ id: cv.id, title: cv.title, color: cv.color, folder: cv.folder });
+  const saveTabs = debounce(() => api.tabsSet({ order, active: cur ? cur.id : null, tabs: order.map((id) => tabMeta(canvases.get(id))) }), 150);
+  let lastSwitchMs = 0;
+
+  function tabInfo(cv) {
+    let busy = false;
+    if (cv.loaded) for (const n of cv.nodes.values()) if (n.status === 'running') { busy = true; break; }
+    return { ...tabMeta(cv), active: cv === cur, running: busy, unseen: cv === cur ? null : cv.unseen };
+  }
+  const tabbar = window.TabBar.create({
+    el: $('#tabs'),
+    keyHint: (i) => (i <= 9 ? registry.label(registry.keysFor(`tab.goto${i}`)[0] || '') : ''),
+    onSelect: (id) => switchTo(id),
+    onClose: (id) => closeTab(id),
+    onNew: () => newTab(),
+    onRename: (id, title) => { const cv = canvases.get(id); if (cv) { cv.title = title; renderTabBar(); saveTabs(); } },
+    onColor: (id, color) => { const cv = canvases.get(id); if (cv) { cv.color = color; renderTabBar(); saveTabs(); } },
+    onReorder: (next) => { order = next.filter((id) => canvases.has(id)); renderTabBar(); saveTabs(); },
+    onDoneEditing: () => focusPrompt(),
   });
-  $('#set-key-remove').addEventListener('click', async () => {
-    await api.setSettings({ apiKey: '' });
-    openSettings('Saved key removed.');
-  });
-  $('#set-import').addEventListener('click', () => { dlg.close('cancel'); importHistory(); });
-  $('#set-clear').addEventListener('click', () => {
-    if (!window.confirm('Remove every card from the canvas? Running commands will be stopped.')) return;
-    for (const n of [...state.nodes.values()]) { if (n.status === 'running') stop(n); unmount(n); dropRich(n); terminals.dispose(n.id); VLines.forget(n.id); api.forget(n.id); }
-    state.nodes.clear();
-    for (const d of dom.values()) d.card.remove();
-    dom.clear();
-    kids.clear(); depth.clear(); running.clear(); grid.clear(); inDom.clear();
-    for (const key of [...edges.keys()]) dropEdge(key);
-    layoutVersion++; treeVersion++;
-    state.activeId = null;
-    state.pipeFrom = null;
-    dlg.close('cancel');
-    updateComposer();
-    scheduleLayout();
-    animateTo({ x: 120, y: 90, k: 1 });
-    saveSoon();
+  function renderTabBar() {
+    tabbar.render(order.map((id) => tabInfo(canvases.get(id))));
+    document.title = cur ? `${cur.title} — Loom` : 'Loom';
+  }
+
+  function addCanvas(meta) {
+    const cv = blankCanvas(meta);
+    canvases.set(cv.id, cv);
+    return cv;
+  }
+  const basename = (p) => (p ? p.replace(/\/+$/, '').split('/').pop() || p : '');
+
+  // Shows a tab: its data loads if it hasn't yet, the old tab's DOM goes.
+  async function switchTo(cid, { focus = true } = {}) {
+    const cv = canvases.get(cid);
+    if (!cv) return null;
+    await loadCanvas(cv);
+    if (cur === cv) { renderTabBar(); return cv; }
+    const t0 = performance.now();
+    if (cur && cur.loaded && canvases.has(cur.id)) saveNow(cur);
+    teardown();
+    cur = cv;
+    cv.unseen = null;
+    buildCanvas();
+    lastSwitchMs = performance.now() - t0;
+    renderTabBar();
+    saveTabs();
+    editor.refreshInfo();
+    if (focus) focusPrompt();
+    return cv;
+  }
+
+  // A new tab, after this one, in `folder` (a project tab) or in this tab's folder.
+  async function newTab({ folder = null, cwd = null, title = null } = {}) {
+    const root = folder || cwd || (cur && cur.loaded ? currentCwd() : sys.home);
+    const keep = folder || (cur && cur.folder && !cwd ? cur.folder : null);
+    const meta = await api.tabsCreate({ title: title || basename(keep || root) || 'Home', folder: keep, after: cur ? cur.id : null });
+    const cv = addCanvas(meta);
+    cv.rootCwd = root;
+    cv.loaded = true;
+    const at = cur ? order.indexOf(cur.id) + 1 : order.length;
+    order.splice(at > 0 ? at : order.length, 0, cv.id);
+    await switchTo(cv.id);
+    saveNow(cv);
+    saveTabs();
+    return cv;
+  }
+
+  // Closing a tab with running commands asks first. Its cards stay on disk
+  // for "Reopen closed tab" (the last ten).
+  async function closeTab(cid = cur && cur.id) {
+    const cv = canvases.get(cid);
+    if (!cv) return false;
+    await loadCanvas(cv);
+    const busy = [...cv.nodes.values()].filter((n) => n.status === 'running');
+    if (busy.length && !(await confirmDialog({
+      title: `Close “${cv.title}”?`, body: `${busy.length === 1 ? 'This command is' : `These ${busy.length} commands are`} still running and will be stopped:`,
+      items: busy.map((n) => n.cmd.split('\n')[0]), ok: 'Close tab',
+    }))) return false;
+    for (const n of busy) n.killed = true;
+    saveNow(cv);
+    const i = order.indexOf(cid);
+    if (cv === cur) {
+      const next = order[i + 1] || order[i - 1];
+      if (next) await switchTo(next);
+      else await newTab({ cwd: cv.rootCwd });
+    }
+    order = order.filter((x) => x !== cid);
+    canvases.delete(cid);
+    await api.tabsClose(cid);
+    renderTabBar();
+    saveTabs();
+    return true;
+  }
+
+  async function reopenTab() {
+    const meta = await api.tabsReopen();
+    if (!meta) { toast('No closed tabs', { timeout: 1600 }); return null; }
+    const cv = addCanvas(meta);
+    order = order.filter((x) => x !== cv.id);
+    order.push(cv.id);
+    await switchTo(cv.id);
+    saveTabs();
+    return cv;
+  }
+
+  function cycleTab(d) {
+    if (order.length < 2 || !cur) return;
+    const i = order.indexOf(cur.id);
+    switchTo(order[(i + d + order.length) % order.length]);
+  }
+
+  // `loom ~/x`, `loom -e "npm test"`, the Dock, Finder: focus the folder's tab
+  // or make one, and run the command there.
+  async function openRequest({ folder, missing, newTab: forceNew, exec }) {
+    if (missing) toast(`There's no folder ${tilde(missing)}`, { kind: 'err' });
+    let cv = null;
+    if (folder && !forceNew) cv = [...canvases.values()].find((c) => c.folder === folder);
+    if (cv) await switchTo(cv.id);
+    else if (folder || forceNew) cv = await newTab({ folder: folder || null, cwd: folder || null });
+    else cv = cur;
+    if (exec) {
+      if (folder) state.rootCwd = folder;
+      setActive(null);
+      runCommand(exec, { parentId: null });
+    }
+    return cv;
+  }
+
+  // A command ended: background tabs get a dot, and a long one gets a
+  // notification when Loom isn't in front.
+  function cardFinished(cv, n) {
+    if (cv !== cur) cv.unseen = n.status === 'error' || cv.unseen === 'error' ? 'error' : 'ok';
+    renderTabBar();
+    const dur = n.endedAt - n.startedAt;
+    if (dur < 10000 || n.killed) return;
+    api.notify({
+      title: `${n.status === 'error' ? 'Failed' : 'Finished'}: ${n.cmd.split('\n')[0].slice(0, 60)}`,
+      body: `${cv.title} · ${fmtDur(dur)}${n.status === 'error' ? ` · exit ${n.exitCode}` : ''}`,
+      cid: cv.id, id: n.id,
+    });
+  }
+  api.onNotifyClick(async ({ cid, id }) => {
+    if (!(await switchTo(cid))) return;
+    const n = state.nodes.get(id);
+    if (n) { setActive(n.id); reveal(n, true); }
   });
 
-  // ================================================================ toolbar, empty state, keys
+  // ================================================================ commands and keys
+  const mac = sys.platform === 'darwin';
+  const isDropdown = sys.window === 'dropdown';
+  const settingsView = $('#settings-view');
+  const registry = window.Commands.create({
+    mac,
+    context: keyContext,
+    onChange: () => {
+      // The menu shows the keys as they are now.
+      const keys = {};
+      for (const c of registry.list()) if (c.keys[0]) keys[c.id] = window.Keys.toAccelerator(c.keys[0]);
+      api.menuKeys(keys);
+      if (settingsPage) settingsPage.keysChanged();
+      renderTabBar();
+    },
+  });
+  const palette = window.Commands.palette({ el: $('#palette'), registry, onClose: () => {} });
+
+  // Where a key was pressed. While a dialog, the palette or settings are
+  // open, only `dialog` commands fire; in a live terminal only global ones.
+  function keyContext(e) {
+    const t = e && e.target && e.target.closest ? e.target : document.activeElement || document.body;
+    const ctx = { mac, dropdown: isDropdown };
+    if (!settingsView.hidden || palette.isOpen() || document.querySelector('dialog[open]')) ctx.dialog = true;
+    if (!$('#term-overlay').hidden) ctx.overlay = true;
+    if (t.closest('.live-term')) ctx.liveTerminal = true;
+    else if (t === els.prompt || t.closest('#composer')) ctx.commandBar = !ctx.dialog;
+    else if (!ctx.dialog) ctx.canvas = true;
+    if (t !== els.prompt && t.matches('input, textarea, select, [contenteditable]')) ctx.textInput = true;
+    if (t.closest('.vt')) ctx.cardBody = true;
+    return ctx;
+  }
+
+  const active = () => state.nodes.get(state.activeId);
+  const onActive = (fn) => () => { const n = active(); if (!n) { toast('No card is selected', { timeout: 1400 }); return true; } return fn(n); };
+  const navigate = (dir) => () => {
+    const a = active();
+    if (!a) return true;
+    let target = null;
+    if (dir === 'up') target = state.nodes.get(a.parentId);
+    if (dir === 'down') target = childrenOf(a.id)[0];
+    if (dir === 'left' || dir === 'right') {
+      const sibs = a.parentId != null ? childrenOf(a.parentId) : [];
+      const i = sibs.findIndex((s) => s.id === a.id);
+      target = sibs[i + (dir === 'right' ? 1 : -1)];
+    }
+    if (target) { setActive(target.id); reveal(target); }
+    return true;
+  };
+  let lastBarEsc = 0;
+  const WORK = 'canvas || commandBar';
+
+  function registerCommands() {
+    const add = (c) => registry.add(c);
+    // Canvas and view
+    add({ id: 'view.fit', title: 'Fit everything', category: 'View', keys: ['Mod+0'], when: WORK, run: () => fit() });
+    add({ id: 'view.zoomIn', title: 'Zoom in', category: 'View', keys: ['Mod+='], when: WORK, run: () => zoomCenter(1.2) });
+    add({ id: 'view.zoomOut', title: 'Zoom out', category: 'View', keys: ['Mod+-'], when: WORK, run: () => zoomCenter(1 / 1.2) });
+    add({ id: 'view.actualSize', title: 'Zoom to 100%', category: 'View', run: () => els.zoomLabel.click() });
+    add({ id: 'view.map', title: 'Toggle the history map', category: 'View', keys: ['Mod+B'], when: WORK, run: () => toggleSidebar() });
+    add({ id: 'canvas.newRoot', title: 'New root', category: 'Canvas', keys: ['Mod+N'], when: WORK, run: () => newRoot() });
+    add({ id: 'canvas.clear', title: 'Clear this tab’s canvas…', category: 'Canvas', run: () => clearCanvas() });
+    // Command bar
+    add({ id: 'composer.focus', title: 'Focus the command bar', category: 'Command bar', keys: ['Mod+K', { key: '/', when: 'canvas && !textInput && !cardBody' }], when: WORK, run: () => focusPrompt() });
+    add({ id: 'composer.askToggle', title: 'Toggle shell / ask Claude', category: 'Command bar', keys: ['Mod+I'], when: `${WORK}`, run: () => setMode(state.mode === 'ai' ? 'shell' : 'ai') });
+    add({ id: 'history.search', title: 'Search history', category: 'Command bar', keys: ['Ctrl+R'], when: `${WORK}`, run: () => { focusPrompt(); editor.openSearch(); } });
+    add({
+      id: 'composer.escape', title: 'Dismiss (close the suggestion, stop piping, clear)', category: 'Command bar', keys: ['Escape'], when: 'commandBar', palette: false,
+      run: () => {
+        const v = els.prompt.value;
+        if (state.suggestion) hideSuggestion();
+        else if (state.pipeFrom != null) setPipe(null);
+        else if (v) editor.clear();
+        else if (isDropdown && performance.now() - lastBarEsc < 400) api.dropdownHide();
+        else if (!isDropdown) els.prompt.blur();
+        lastBarEsc = performance.now();
+        return true;
+      },
+    });
+    add({
+      id: 'card.interrupt', title: 'Stop the active card’s command (Ctrl+C)', category: 'Card', keys: ['Ctrl+C'], when: 'commandBar', palette: false,
+      run: () => {
+        if (els.prompt.selectionStart !== els.prompt.selectionEnd) return false;
+        const a = active();
+        if (a && a.status === 'running') { stop(a); return true; }
+        if (els.prompt.value) { editor.clear(); return true; }
+        return false;
+      },
+    });
+    add({
+      id: 'card.eof', title: 'Send EOF to the active card', category: 'Card', keys: ['Ctrl+D'], when: 'commandBar', palette: false,
+      run: () => { const a = active(); if (els.prompt.value || !a || a.status !== 'running') return false; api.stdin({ id: a.key, eof: true }); return true; },
+    });
+    // Cards
+    add({ id: 'card.find', title: 'Find in the card’s output', category: 'Card', keys: ['Mod+F'], when: WORK, run: (ctx) => { const inCard = ctx.event && ctx.event.target.closest && ctx.event.target.closest('.card'); return findInCard(state.nodes.get(inCard ? Number(inCard.dataset.id) : state.activeId)) || undefined; } });
+    for (const [act, title, id] of [['stop', 'Stop', 'card.stop'], ['rerun', 'Run again', 'card.rerun'], ['branch', 'Branch from here', 'card.branch'], ['pipe', 'Pipe output into a new command', 'card.pipe'],
+      ['explain', 'Explain with Claude', 'card.explain'], ['copy', 'Copy output', 'card.copy'], ['save', 'Save output…', 'card.save'], ['open', 'Open output in editor', 'card.open'],
+      ['expand', 'Expand terminal', 'card.expand'], ['delete', 'Remove card', 'card.delete']]) {
+      add({ id, title, category: 'Card', when: WORK, run: onActive((n) => { cardAction(n, act); return true; }) });
+    }
+    add({ id: 'card.collapse', title: 'Collapse or expand the card', category: 'Card', when: WORK, run: onActive((n) => { n.collapsed = !n.collapsed; updateCard(n); scheduleLayout(); saveSoon(); return true; }) });
+    add({ id: 'card.parent', title: 'Go to the parent card', category: 'Card', keys: ['Alt+ArrowUp'], when: WORK, run: navigate('up') });
+    add({ id: 'card.child', title: 'Go to the first child card', category: 'Card', keys: ['Alt+ArrowDown'], when: WORK, run: navigate('down') });
+    add({ id: 'card.prevSibling', title: 'Go to the previous branch', category: 'Card', keys: ['Alt+ArrowLeft'], when: WORK, run: navigate('left') });
+    add({ id: 'card.nextSibling', title: 'Go to the next branch', category: 'Card', keys: ['Alt+ArrowRight'], when: WORK, run: navigate('right') });
+    // Live terminals: these work while a program has the keyboard.
+    add({ id: 'terminal.escape', title: 'Esc Esc: back to the canvas', category: 'Terminal', keys: ['Escape'], when: 'liveTerminal', global: true, palette: false, run: () => terminals.escape() });
+    add({ id: 'terminal.release', title: 'Return from the terminal to the canvas', category: 'Terminal', keys: ['Mod+Shift+E', ...(mac ? ['Ctrl+Shift+E'] : [])], when: 'liveTerminal || overlay', global: true, run: () => (terminals.releaseFocused() ? true : (terminals.collapse(), focusPrompt(), true)) });
+    add({ id: 'terminal.find', title: 'Find in the terminal', category: 'Terminal', keys: ['Mod+Shift+F'], when: 'liveTerminal', global: true, run: () => terminals.findFocused() });
+    add({ id: 'terminal.copy', title: 'Copy the terminal selection', category: 'Terminal', keys: ['Ctrl+Shift+C'], when: 'liveTerminal', global: true, palette: false, run: () => terminals.copyFocused() });
+    // Tabs
+    add({ id: 'tab.new', title: 'New tab', category: 'Tabs', keys: ['Mod+T'], run: () => { newTab(); } });
+    add({ id: 'tab.close', title: 'Close tab', category: 'Tabs', keys: ['Mod+W'], run: () => { closeTab(); } });
+    add({ id: 'tab.reopen', title: 'Reopen closed tab', category: 'Tabs', keys: ['Mod+Shift+T'], run: () => { reopenTab(); } });
+    add({ id: 'tab.next', title: 'Next tab', category: 'Tabs', keys: ['Ctrl+Tab', ...(mac ? ['Shift+Cmd+]'] : [])], run: () => cycleTab(1) });
+    add({ id: 'tab.prev', title: 'Previous tab', category: 'Tabs', keys: ['Ctrl+Shift+Tab', ...(mac ? ['Shift+Cmd+['] : [])], run: () => cycleTab(-1) });
+    for (let i = 1; i <= 9; i++) {
+      add({ id: `tab.goto${i}`, title: i === 9 ? 'Go to the last tab' : `Go to tab ${i}`, category: 'Tabs', keys: [`Mod+${i}`], palette: i === 1 || i === 9, run: () => { const id = i === 9 ? order[order.length - 1] : order[i - 1]; if (id) switchTo(id); } });
+    }
+    add({ id: 'tab.rename', title: 'Rename tab', category: 'Tabs', run: () => { if (cur) tabbar.rename(cur.id); } });
+    add({ id: 'tab.color', title: 'Pick a color for this tab', category: 'Tabs', run: () => { if (cur) tabbar.pickColor(cur.id); } });
+    add({ id: 'tab.openFolder', title: 'Open folder in a new tab…', category: 'Tabs', run: async () => { const p = await api.pickFolder(); if (p) openRequest({ folder: p }); } });
+    // App
+    add({ id: 'palette.open', title: 'Show all commands', category: 'Loom', keys: ['Mod+Shift+P'], global: true, palette: false, run: () => (palette.isOpen() ? palette.close() : palette.open()) });
+    add({ id: 'settings.open', title: 'Settings', category: 'Loom', keys: ['Mod+,'], global: true, run: () => openSettings() });
+    add({ id: 'settings.keys', title: 'Keyboard shortcuts', category: 'Loom', run: () => openSettings('', 'keys') });
+    add({ id: 'settings.editJson', title: 'Edit settings.json', category: 'Loom', run: () => api.editSettings() });
+    add({ id: 'keys.editJson', title: 'Edit keybindings.json', category: 'Loom', run: () => api.keysEdit() });
+    add({ id: 'font.bigger', title: 'Bigger text', category: 'View', keys: ['Mod+Shift+='], global: true, run: () => fontStep(0.5) });
+    add({ id: 'font.smaller', title: 'Smaller text', category: 'View', keys: ['Mod+Shift+-'], global: true, run: () => fontStep(-0.5) });
+    add({ id: 'font.reset', title: 'Default text size', category: 'View', keys: ['Mod+Shift+0'], global: true, run: () => api.setSettings({ fontSize: 12.5 }) });
+    add({ id: 'theme.import', title: 'Import a theme (.itermcolors, Windows Terminal)…', category: 'Theme', run: () => api.themesImport({}) });
+    add({ id: 'theme.folder', title: 'Open the themes folder', category: 'Theme', run: () => api.themesFolder() });
+    add({ id: 'history.import', title: 'Import shell history', category: 'Loom', run: () => importHistory() });
+    add({ id: 'loom.about', title: 'About Loom', category: 'Loom', run: () => api.about() });
+    add({ id: 'loom.reportIssue', title: 'Report an issue…', category: 'Help', run: () => api.reportIssue() });
+    add({ id: 'loom.copyDebug', title: 'Copy debug info', category: 'Help', run: async () => { await api.copyText(await api.debugInfo()); toast('Debug info copied', { timeout: 1600 }); } });
+    add({ id: 'env.open', title: 'Open .env file', category: 'Loom', run: () => api.openDotenv() });
+    add({ id: 'dropdown.toggle', title: 'Show or hide the dropdown terminal', category: 'Dropdown', run: () => api.dropdownToggle() });
+    if (isDropdown) {
+      add({ id: 'dropdown.hide', title: 'Hide the dropdown', category: 'Dropdown', run: () => api.dropdownHide() });
+      add({ id: 'dropdown.pin', title: 'Pin or unpin the dropdown', category: 'Dropdown', run: () => togglePin() });
+      add({ id: 'dropdown.escEsc', title: 'Esc Esc: hide the dropdown', category: 'Dropdown', keys: ['Escape'], when: 'canvas && !textInput', palette: false, run: () => { const now = performance.now(); if (now - lastBarEsc < 400) { api.dropdownHide(); return true; } lastBarEsc = now; return false; } });
+    }
+    const integ = (fn, what) => async () => {
+      const res = await fn(what);
+      if (res.ok === false) toast(res.error, { kind: 'err', timeout: 8000 });
+      else toast(res.message || (res.removed && res.removed.length ? `Removed ${res.removed.join(', ')}` : 'Nothing to remove'), { timeout: 8000 });
+    };
+    add({ id: 'loom.installCommand', title: "Install 'loom' command in PATH", category: 'Shell command', run: integ(api.integrationsInstall, 'launcher') });
+    add({ id: 'loom.uninstallCommand', title: "Uninstall 'loom' command", category: 'Shell command', run: integ(api.integrationsUninstall, 'launcher') });
+    if (mac) add({ id: 'loom.installFinder', title: 'Install Finder Quick Action “Open in Loom”', category: 'Shell command', run: integ(api.integrationsInstall, 'finder') });
+    if (sys.platform === 'linux') add({ id: 'loom.installLinux', title: 'Install “Open in Loom” for file managers', category: 'Shell command', run: integ(api.integrationsInstall, 'linux') });
+  }
+
+  // Themes are commands too: "Theme: Nord".
+  function registerThemeCommands(list) {
+    for (const c of registry.list()) if (c.id.startsWith('theme.set:')) registry.remove(c.id);
+    for (const t of list.themes) {
+      registry.add({
+        id: `theme.set:${t.id}`, title: `${t.name}${t.contrast.length ? ' (low contrast)' : ''}`, category: 'Theme',
+        run: () => api.setSettings(t.type === 'dark' ? { themeDark: t.id, themeMode: settingsNow.themeMode === 'light' ? 'dark' : settingsNow.themeMode } : { themeLight: t.id, themeMode: settingsNow.themeMode === 'dark' ? 'light' : settingsNow.themeMode }),
+      });
+    }
+    registry.rebuild();
+  }
+
+  // Every key goes through here first (capture), except in the command bar,
+  // whose editor gets keys before the commands do (see els.prompt below).
+  document.addEventListener('keydown', (e) => {
+    const t = e.target;
+    if (t === els.prompt || (t.closest && t.closest('#hsearch'))) return;
+    if (registry.handle(e)) return;
+    // Typing on the canvas goes to the command bar.
+    const ctx = keyContext(e);
+    if (ctx.canvas && !ctx.textInput && !ctx.cardBody && !e.metaKey && !e.ctrlKey && !e.altKey && e.key.length === 1) focusPrompt();
+  }, true);
+  api.onCommand((id) => registry.run(id));
+
+  // ================================================================ settings, themes, fonts
+  let settingsNow = {};
+  let settingsPage = null;
+  function openSettings(note = '', section = null) {
+    settingsPage.open(section || (note ? 'claude' : null), note);
+  }
+
+  async function fontStep(d) {
+    const size = Math.max(8, Math.min(32, Math.round(((settingsNow.fontSize || 12.5) + d) * 2) / 2));
+    await api.setSettings({ fontSize: size });
+  }
+
+  // Cards draw with the theme's colors and the font's metrics: rebuild what's on screen.
+  function remountAll() {
+    VLines.forgetAll();
+    for (const [id, d] of dom) if (d.mode !== 'stub') unmount(state.nodes.get(id));
+    colors = null;
+    mmVersion = -1;
+    terminals.setOptions();
+    scheduleLayout();
+  }
+
+  let themeId = null;
+  async function applyTheme() {
+    const id = window.Theme.pick(settingsNow, window.matchMedia('(prefers-color-scheme: dark)').matches);
+    if (id === themeId && window.Theme.current()) return;
+    const t = await api.themesGet(id);
+    if (!t) return;
+    themeId = t.id;
+    window.Theme.apply(t);
+    remountAll();
+  }
+
+  let fontKey = '';
+  function applyFonts() {
+    const k = ['fontFamily', 'fontSize', 'lineHeight', 'fontWeight', 'ligatures'].map((x) => settingsNow[x]).join('|');
+    if (k === fontKey) return;
+    fontKey = k;
+    window.Theme.applyFonts(settingsNow);
+    LINE_H = window.Theme.fonts().lineH;
+    measureChar();
+    remountAll();
+  }
+
+  function onSettings(p) {
+    const prev = settingsNow;
+    settingsNow = p.settings;
+    applyFonts();
+    applyTheme();
+    if (['cursorStyle', 'cursorBlink', 'scrollback'].some((k) => prev[k] !== settingsNow[k])) terminals.setOptions();
+    if (settingsPage) settingsPage.update(p);
+  }
+  api.onSettings(onSettings);
+  api.onThemes(async (list) => {
+    themeId = null;
+    await applyTheme();
+    registerThemeCommands(list);
+    if (settingsPage) settingsPage.themes(list);
+  });
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => applyTheme());
+  api.onKeys(({ list, error }) => {
+    registry.setOverrides(list);
+    if (error) toast(error, { kind: 'err', timeout: 6000 });
+  });
+
+  // ================================================================ toolbar, empty state
   $('#btn-map').onclick = () => toggleSidebar();
   $('#btn-newroot').onclick = newRoot;
   $('#btn-fit').onclick = () => fit();
@@ -1912,6 +2295,8 @@ Respond with only a JSON object (no prose, no code fences):
   $('#btn-zoomout').onclick = () => zoomCenter(1 / 1.2);
   els.zoomLabel.onclick = () => { const a = state.nodes.get(state.activeId); if (a) { state.view.k = 1; reveal(a, true); } else animateTo({ ...state.view, k: 1 }); };
   $('#btn-settings').onclick = () => openSettings();
+  $('#btn-palette').onclick = () => palette.open();
+  $('#btn-palette').textContent = mac ? '⌘⇧P' : 'Ctrl+Shift+P';
   els.empty.addEventListener('click', (e) => {
     const b = e.target.closest('.chip');
     if (!b) return;
@@ -1919,54 +2304,26 @@ Respond with only a JSON object (no prose, no code fences):
     else ask(b.dataset.ask);
   });
 
-  document.addEventListener('keydown', (e) => {
-    const mod = e.metaKey || e.ctrlKey;
-    // Ctrl+K, Alt+arrows and the like belong to the program in a live terminal.
-    if (e.target.closest('.live-term') && !(sys.platform === 'darwin' && e.metaKey)) return;
-    const typing = e.target.matches('input, textarea, [contenteditable]');
-    if (e.target.closest('.vt') && !mod) return; // the card body's own keys
-    if (mod && e.key.toLowerCase() === 'k') { e.preventDefault(); focusPrompt(); return; }
-    if (mod && e.key === '0') { e.preventDefault(); fit(); return; }
-    if (mod && (e.key === '=' || e.key === '+')) { e.preventDefault(); zoomCenter(1.2); return; }
-    if (mod && e.key === '-') { e.preventDefault(); zoomCenter(1 / 1.2); return; }
-    if (mod && e.key.toLowerCase() === 'b') { e.preventDefault(); toggleSidebar(); return; }
-    if (mod && e.key.toLowerCase() === 'n') { e.preventDefault(); newRoot(); return; }
-    if (mod && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'f') {
-      const inCard = e.target.closest && e.target.closest('.card');
-      const n = state.nodes.get(inCard ? Number(inCard.dataset.id) : state.activeId);
-      if (findInCard(n)) e.preventDefault();
-      return;
-    }
-    if (e.ctrlKey && !e.metaKey && e.key === 'r' && !typing) { e.preventDefault(); focusPrompt(); editor.openSearch(); return; }
-    if (mod && e.key.toLowerCase() === 'i' && !typing) { e.preventDefault(); setMode(state.mode === 'ai' ? 'shell' : 'ai'); return; }
-    if (e.altKey && e.key.startsWith('Arrow')) {
-      const a = state.nodes.get(state.activeId);
-      if (!a) return;
-      e.preventDefault();
-      let target = null;
-      if (e.key === 'ArrowUp') target = state.nodes.get(a.parentId);
-      if (e.key === 'ArrowDown') target = childrenOf(a.id)[0];
-      if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
-        const sibs = a.parentId != null ? childrenOf(a.parentId) : [];
-        const i = sibs.findIndex((s) => s.id === a.id);
-        target = sibs[i + (e.key === 'ArrowRight' ? 1 : -1)];
-      }
-      if (target) { setActive(target.id); reveal(target); }
-      return;
-    }
-    if (!typing && !mod && (e.key === '/' || (e.key.length === 1 && !e.altKey))) {
-      if (dlg.open) return;
-      focusPrompt();
-      if (e.key === '/') e.preventDefault();
-    }
-  });
+  let pinned = false;
+  async function togglePin() {
+    pinned = await api.dropdownPin(!pinned);
+    $('#btn-pin').classList.toggle('on', pinned);
+    $('#btn-pin').title = pinned ? 'Pinned: stays open when it loses focus' : 'Keep the dropdown open';
+  }
+  if (isDropdown) {
+    document.body.classList.add('window-dropdown');
+    $('#btn-pin').hidden = false;
+    $('#btn-pin').onclick = togglePin;
+    api.onDropdownShown(() => focusPrompt());
+  }
 
   window.addEventListener('resize', () => scheduleLayout());
 
   // ================================================================ persistence
-  // session.json holds card metadata only; output is already on disk in main.
-  // Only cards that changed since the last save are sent, and main writes the
-  // file debounced, atomically, and only when it changed.
+  // Each canvas is saved on its own (userData/canvases/<id>.json), card
+  // metadata only: output is already on disk in main. Only cards that changed
+  // since the last save are sent, and main writes the file debounced,
+  // atomically, and only when it changed.
   const SAVE_FIELDS = ['id', 'cmd', 'cwd', 'cwdAfter', 'parentId', 'pipeFrom', 'x', 'y', 'w', 'bodyH', 'h', 'status', 'exitCode', 'startedAt', 'endedAt', 'view', 'ai', 'collapsed', 'envFile', 'noHistory', 'richKind', 'capped'];
   function nodeMeta(n) {
     const o = {};
@@ -1976,61 +2333,108 @@ Respond with only a JSON object (no prose, no code fences):
     if (o.h) o.h = Math.round(o.h);
     return o;
   }
-  const sessionMeta = () => ({ nextId: state.nextId, view: state.view, activeId: state.activeId, rootCwd: state.rootCwd, sidebar: !els.sidebar.hidden });
-  function serialize() {
-    return { v: 2, ...sessionMeta(), nodes: [...state.nodes.values()].map(nodeMeta) };
+  const canvasMeta = (cv) => ({ nextId: cv.nextId, view: cv.view, activeId: cv.activeId, rootCwd: cv.rootCwd, sidebar: !!cv.sidebar });
+  function serialize(cv = cur) {
+    return { v: 3, ...canvasMeta(cv), nodes: [...cv.nodes.values()].map(nodeMeta) };
   }
-  const sent = new Map(); // id -> JSON last sent
-  let sentMeta = '';
-  function saveNow() {
-    const patch = { nodes: {} };
+  function saveNow(cv = cur) {
+    if (!cv || !cv.loaded || !canvases.has(cv.id)) return;
+    if (cv === cur) cv.sidebar = !els.sidebar.hidden;
+    const patch = { cid: cv.id, nodes: {} };
     let any = false;
-    for (const n of state.nodes.values()) {
+    for (const n of cv.nodes.values()) {
       const o = nodeMeta(n);
       const j = JSON.stringify(o);
-      if (sent.get(n.id) !== j) { sent.set(n.id, j); patch.nodes[n.id] = o; any = true; }
+      if (cv.sent.get(n.id) !== j) { cv.sent.set(n.id, j); patch.nodes[n.id] = o; any = true; }
     }
-    for (const id of [...sent.keys()]) if (!state.nodes.has(id)) { sent.delete(id); patch.nodes[id] = null; any = true; }
-    const m = sessionMeta();
+    for (const id of [...cv.sent.keys()]) if (!cv.nodes.has(id)) { cv.sent.delete(id); patch.nodes[id] = null; any = true; }
+    const m = canvasMeta(cv);
     const mj = JSON.stringify(m);
-    if (mj !== sentMeta) { sentMeta = mj; patch.meta = m; any = true; }
-    if (any) api.patchSession(patch);
+    if (mj !== cv.sentMeta) { cv.sentMeta = mj; patch.meta = m; any = true; }
+    if (any) api.canvasPatch(patch);
   }
-  const saveSoon = debounce(saveNow, 600);
+  const saveTimers = new Map();
+  function saveSoon(cv = cur) {
+    if (!cv) return;
+    clearTimeout(saveTimers.get(cv.id));
+    saveTimers.set(cv.id, setTimeout(() => saveNow(cv), 600));
+  }
   window.addEventListener('beforeunload', () => {
     // Commands still running are saved without an exit code.
-    for (const n of state.nodes.values()) if (n.histRec) api.historyAdd(n.histRec);
-    saveNow();
+    for (const cv of canvases.values()) {
+      if (!cv.loaded) continue;
+      for (const n of cv.nodes.values()) if (n.histRec) api.historyAdd(n.histRec);
+      saveNow(cv);
+    }
   });
 
-  // Every card starts as an empty box of its saved size; the ones in view
-  // get their insides on the first frames.
-  async function restore() {
-    const s = await api.loadSession();
-    if (!s || (s.v !== 1 && s.v !== 2)) return;
-    state.nextId = s.nextId || 1;
-    state.view = s.view || state.view;
-    // Sessions from before history.jsonl kept a list of plain commands.
-    if (Array.isArray(s.history) && !state.history.length) {
-      for (const cmd of s.history) if (typeof cmd === 'string') { const r = { cmd, cwd: null, exitCode: null, startedAt: 0 }; state.history.push(r); api.historyAdd(r); }
-    }
-    state.rootCwd = s.rootCwd || sys.home;
-    const list = (s.nodes || []).slice().sort((a, b) => a.id - b.id);
-    for (const o of list) {
-      const n = { ...o, killed: false, rich: null, out: null };
-      delete n.segs;
-      if (n.status === 'running') n.status = 'interrupted';
-      if (n.h == null) n.h = HEAD_H + Math.min(n.bodyH || 300, 300);
-      state.nodes.set(n.id, n);
-      addEl(n, false);
-    }
-    for (const o of list) treeAdd(state.nodes.get(o.id));
-    for (const o of list) syncEdges(state.nodes.get(o.id));
-    if (s.sidebar) toggleSidebar(true);
-    state.activeId = state.nodes.has(s.activeId) ? s.activeId : null;
-    for (const n of state.nodes.values()) sent.set(n.id, JSON.stringify(nodeMeta(n)));
-    sentMeta = JSON.stringify(sessionMeta());
+  // A canvas's cards, from main. Running cards from before a restart are
+  // interrupted; every card gets its key.
+  function loadCanvas(cv) {
+    if (cv.loaded) return Promise.resolve(cv);
+    if (cv.loading) return cv.loading;
+    cv.loading = (async () => {
+      const s = await api.canvasLoad(cv.id);
+      cv.nodes = new Map();
+      if (s) {
+        cv.nextId = s.nextId || 1;
+        cv.view = s.view || cv.view;
+        cv.rootCwd = s.rootCwd || cv.rootCwd;
+        cv.sidebar = !!s.sidebar;
+        for (const o of (s.nodes || []).slice().sort((a, b) => a.id - b.id)) {
+          const n = { ...o, killed: false, rich: null, out: null, key: `${cv.id}.${o.id}` };
+          if (n.status === 'running') n.status = 'interrupted';
+          if (n.h == null) n.h = HEAD_H + Math.min(n.bodyH || 300, 300);
+          cv.nodes.set(n.id, n);
+        }
+        cv.activeId = cv.nodes.has(s.activeId) ? s.activeId : null;
+        for (const n of cv.nodes.values()) cv.sent.set(n.id, JSON.stringify(nodeMeta(n)));
+        cv.sentMeta = JSON.stringify(canvasMeta(cv));
+      }
+      cv.loaded = true;
+      return cv;
+    })();
+    return cv.loading;
+  }
+
+  // The current canvas's DOM: every card an empty box of its saved size; the
+  // ones in view get their insides on the first frames.
+  function buildCanvas() {
+    const list = [...state.nodes.values()].sort((a, b) => a.id - b.id);
+    for (const n of list) addEl(n, false);
+    for (const n of list) treeAdd(n);
+    for (const n of list) { syncEdges(n); if (n.status === 'running') running.add(n.id); }
+    els.sidebar.hidden = !cur.sidebar;
+    document.body.classList.toggle('with-sidebar', !els.sidebar.hidden);
+    if (!els.sidebar.hidden) { mapKey = ''; renderTree(); }
     markActivePath();
+    applyView();
+    updateComposer();
+    scheduleLayout();
+  }
+
+  // Takes down the current canvas's DOM. Its data stays, and its running
+  // cards stop streaming to the page (main still records them).
+  function teardown() {
+    for (const n of state.nodes.values()) {
+      if (terminals.has(n.key)) terminals.release(n.key);
+      unmount(n);
+    }
+    terminals.collapse();
+    for (const d of dom.values()) d.card.remove();
+    dom.clear(); inDom.clear(); running.clear(); kids.clear(); depth.clear(); grid.clear(); edgeGrid.clear();
+    for (const key of [...edges.keys()]) dropEdge(key);
+    moved.clear(); heightChanged.clear(); dirty.clear();
+    mountQueue = [];
+    activeSet = new Set();
+    layoutVersion++;
+    treeVersion++;
+    boundsVersion = -1;
+    mmVersion = -1;
+    mapKey = '';
+    hideSuggestion();
+    editor.closePopup();
+    if (state.pipeFrom != null) state.pipeFrom = null;
   }
 
   // ================================================================ history import
@@ -2054,41 +2458,83 @@ Respond with only a JSON object (no prose, no code fences):
 
   // ================================================================ boot
   let smokeOut = null; // the e2e run's view of card output
+  registerCommands();
+  settingsPage = window.SettingsPage.create({
+    api, el: settingsView, registry, mac, toast,
+    onClose: (back) => { if (back && back.isConnected && back !== document.body) back.focus(); else focusPrompt(); },
+    actions: { importHistory, clearCanvas, showDropdown: () => api.dropdownToggle() },
+  });
+  const [page0, themes0, keys0] = await Promise.all([api.getSettings(), api.themesList(), api.keysGet()]);
+  settingsNow = page0.settings;
+  window.Theme.applyFonts(settingsNow);
+  fontKey = ['fontFamily', 'fontSize', 'lineHeight', 'fontWeight', 'ligatures'].map((x) => settingsNow[x]).join('|');
+  LINE_H = window.Theme.fonts().lineH;
+  measureChar();
+  await applyTheme();
+  registerThemeCommands(themes0);
+  registry.setOverrides(keys0.list);
+  if (keys0.error) toast(keys0.error, { kind: 'err', timeout: 6000 });
+  if (page0.errors.length) toast(`settings.json: ${page0.errors[0]}${page0.errors.length > 1 ? ` (and ${page0.errors.length - 1} more)` : ''}`, { kind: 'err', action: 'Settings', onAction: () => openSettings(), timeout: 8000 });
+
   state.history = await api.historyLoad();
-  await restore();
-  applyView();
-  updateComposer();
-  scheduleLayout();
+  const tabs0 = await api.tabsGet();
+  order = tabs0.order.slice();
+  for (const t of tabs0.tabs) addCanvas(t);
+  await switchTo(tabs0.active || order[0], { focus: false });
   focusPrompt();
   // When the restored cards are first on screen, for the bench.
   let firstPaint = 0;
   let firstPaintPerf = 0;
   requestAnimationFrame(() => requestAnimationFrame(() => { firstPaint = Date.now(); firstPaintPerf = performance.now(); }));
-  if (!sys.bench) offerImport();
+  if (!sys.bench && !isDropdown) offerImport();
+  // An AppImage isn't in the applications menu until it's added: offer once.
+  if (sys.appImage && !isDropdown) {
+    api.appImageOffer().then((offer) => {
+      if (!offer) return;
+      toast('Add Loom to your applications menu, with “Open in Loom” for folders?', {
+        action: 'Add', timeout: 20000,
+        onAction: async () => { const r = await api.appImageIntegrate(); toast(r.ok ? 'Loom is in your applications menu.' : `Couldn't add it: ${r.error}`, { kind: r.ok ? '' : 'err' }); },
+      });
+    });
+  }
+  // The other tabs' data, in the background, so switching never waits.
+  (async () => { for (const id of order) { const cv = canvases.get(id); if (cv && !cv.loaded) { await loadCanvas(cv); renderTabBar(); } } })();
+  // Requests from `loom` and the like that arrived while this window loaded.
+  for (const req of await api.rendererReady()) await openRequest(req);
+  api.onOpen((req) => openRequest(req));
 
   if (sys.bench) {
     window.addEventListener('error', (e) => console.log(`ERR ${e.message} @${e.filename && e.filename.split('/').pop()}:${e.lineno}`));
     window.addEventListener('unhandledrejection', (e) => console.log(`REJ ${e.reason && e.reason.stack}`));
+    // bench.js isn't part of a packaged app; it's loaded only for the bench.
+    await new Promise((resolve, reject) => { const sc = document.createElement('script'); sc.src = 'bench.js'; sc.onload = resolve; sc.onerror = reject; document.head.append(sc); });
     window.LoomBench.run({
       api, sys, state, els, runCommand, applyView, fit, toggleSidebar, focusPrompt,
       clearPrompt: () => editor.clear(),
       firstPaint: () => firstPaint,
       firstPaintPerf: () => firstPaintPerf,
       bodiesReady: () => !mountQueue.length && [...dom.values()].every((d) => d.mode !== 'full' || !d.holding),
-      flush: () => { saveNow(); return api.saveSession(serialize()); },
+      flush: () => { saveNow(); return api.canvasSave({ cid: cur.id, data: serialize() }); },
     }).catch((e) => { console.log(`BENCH ${e.stack}`); api.smokeDone(); });
-  } else if (sys.smoke) {
+  } else if (sys.smoke && !isDropdown) {
     window.addEventListener('error', (e) => console.log(`ERR ${e.message} @${e.filename && e.filename.split('/').pop()}:${e.lineno}`));
     window.addEventListener('unhandledrejection', (e) => console.log(`REJ ${e.reason && e.reason.stack}`));
     runSmoke().catch((e) => { console.log(`SMOKE ${e.stack}`); api.smokeDone(); });
+  } else if (sys.smoke && isDropdown) {
+    // The main window's e2e run drives the dropdown through this.
+    window.__loomSmoke = async (cmd) => {
+      if (cmd.run) { const n = runCommand(cmd.run, { parentId: null }); return n ? n.key : null; }
+      if (cmd.status) { const n = nodeOf(cmd.status); return n ? n.status : null; }
+      if (cmd.state) return { tabs: order.length, cards: state.nodes.size, focused: document.hasFocus(), prompt: document.activeElement === els.prompt };
+      return null;
+    };
   }
-
 
   async function runSmoke() {
     const wait = (ms) => new Promise((r) => setTimeout(r, ms));
     const outs = new Map();
     // Big outputs stay in main; the checks on them read ranges.
-    const fetchOut = async (n) => { if (!n || (n.out && n.out.bytes > 16 * 1048576)) return; outs.set(n.id, { raw: await api.smokeOut({ id: n.id, raw: true }), plain: await api.smokeOut({ id: n.id }) }); };
+    const fetchOut = async (n) => { if (!n || (n.out && n.out.bytes > 16 * 1048576)) return; outs.set(n.id, { raw: await api.smokeOut({ id: n.key, raw: true }), plain: await api.smokeOut({ id: n.key }) }); };
     const done = async (n) => { for (let i = 0; i < 300 && n && n.status === 'running'; i++) await wait(100); await wait(250); await fetchOut(n); };
     const results = [];
     const check = (name, ok, detail) => results.push({ name, ok: !!ok, detail: JSON.stringify(detail) });
@@ -2102,6 +2548,8 @@ Respond with only a JSON object (no prose, no code fences):
     };
     if (sys.smokeResume) { await smokeResume({ run, text, check }); await api.smokeReport(results); api.smokeDone(); return; }
     if (sys.smokeMigrate) { await smokeMigrate({ check }); await api.smokeReport(results); api.smokeDone(); return; }
+    if (sys.smokeLauncher) { await smokeLauncher({ check, wait }); await api.smokeReport(results); api.smokeDone(); return; }
+    if (sys.smokePackaged) { await smokePackaged({ run, text, check, wait }); await api.smokeReport(results); api.smokeDone(); return; }
 
     check('uses PTY sessions', sys.sessions, sys);
     // ---- first launch: one opt-in toast to import shell history
@@ -2207,14 +2655,14 @@ Respond with only a JSON object (no prose, no code fences):
 
     const reader = runCommand('read x; echo "got:$x"', { parentId: null });
     await wait(700);
-    api.stdin({ id: reader.id, data: 'typed\n' });
+    api.stdin({ id: reader.key, data: 'typed\n' });
     await done(reader);
     check('stdin reaches the command', text(reader).endsWith('got:typed'), text(reader));
     const eof = runCommand('cat', { parentId: null });
     await wait(700);
-    api.stdin({ id: eof.id, data: 'line\n' });
+    api.stdin({ id: eof.key, data: 'line\n' });
     await wait(200);
-    api.stdin({ id: eof.id, eof: true });
+    api.stdin({ id: eof.key, eof: true });
     await done(eof);
     check('EOF ends the command', eof.status === 'ok', eof.status);
 
@@ -2257,6 +2705,7 @@ Respond with only a JSON object (no prose, no code fences):
     await smokeEditor({ run, text, check, wait, done });
     await smokeTerminals({ run, text, check, wait, done });
     await smokeOutput({ run, check, wait });
+    await smokeApp({ check, wait });
     for (const n of state.nodes.values()) if (!outs.has(n.id)) await fetchOut(n);
     const leak = [...state.nodes.values()].filter((n) => /LEAK|__loom|source '|133;/.test(text(n)));
     check('no prompt or hook text on any card', !leak.length, leak.map((n) => [n.cmd, rawOf(n).slice(0, 200)]));
@@ -2276,7 +2725,7 @@ Respond with only a JSON object (no prose, no code fences):
     state.view.k = 1;
     reveal(log, true);
     await wait(700);
-    await api.saveSession(serialize());
+    await api.canvasSave({ cid: cur.id, data: serialize() });
     api.smokeDone({ suffix: 'zoom' });
   }
 
@@ -2292,19 +2741,19 @@ Respond with only a JSON object (no prose, no code fences):
     const hatch = { key: 'E', modifiers: ['control', 'shift'] };
     const start = (cmd) => runCommand(cmd, { parentId: null });
     const screen = (n) => {
-      const term = terminals.term(n.id);
+      const term = terminals.term(n.key);
       if (!term) return '';
       const b = term.buffer.active;
       let out = '';
       for (let i = b.viewportY; i < b.viewportY + term.rows; i++) { const l = b.getLine(i); out += `${l ? l.translateToString(true) : ''}\n`; }
       return out;
     };
-    const keyboardOn = (n) => document.activeElement === (terminals.term(n.id) || {}).textarea;
+    const keyboardOn = (n) => document.activeElement === (terminals.term(n.key) || {}).textarea;
     const showing = () => [...document.querySelectorAll('.live-term')].filter((e) => !e.hidden && e.offsetParent);
 
     // ---- vim
     const vim = start('vim README.md');
-    check('vim: expands to the overlay', await until(() => terminals.stats().overlay === vim.id), terminals.stats());
+    check('vim: expands to the overlay', await until(() => terminals.stats().overlay === vim.key), terminals.stats());
     await until(() => /README/.test(screen(vim)));
     const slot = $('#term-slot').getBoundingClientRect();
     check('vim: overlay is about 90% of the window', slot.width / window.innerWidth > 0.85 && slot.height / window.innerHeight > 0.85, [slot.width, slot.height]);
@@ -2326,14 +2775,14 @@ Respond with only a JSON object (no prose, no code fences):
     await until(() => /PID/.test(screen(top)));
     await wait(500);
     // macOS top uses the alternate screen. Linux top redraws in place, so it stays on the card.
-    check('top: expands if it takes the alternate screen', terminals.inAlt(top.id) === (terminals.stats().overlay === top.id), terminals.stats());
-    if (terminals.stats().overlay !== top.id) cardAction(top, 'expand');
+    check('top: expands if it takes the alternate screen', terminals.inAlt(top.key) === (terminals.stats().overlay === top.key), terminals.stats());
+    if (terminals.stats().overlay !== top.key) cardAction(top, 'expand');
     const first = screen(top);
     await wait(2500);
     check('top: redraws live', screen(top) !== first, null);
-    const cols0 = terminals.term(top.id).cols;
+    const cols0 = terminals.term(top.key).cols;
     await api.smokeResize({ width: 1100, height: 700 });
-    check('top: follows the window size', await until(() => terminals.term(top.id).cols !== cols0), [cols0, terminals.term(top.id).cols]);
+    check('top: follows the window size', await until(() => terminals.term(top.key).cols !== cols0), [cols0, terminals.term(top.key).cols]);
     await api.smokeResize({ width: 1480, height: 920 });
 
     // ---- zoom, using top as the spec does
@@ -2345,7 +2794,7 @@ Respond with only a JSON object (no prose, no code fences):
     reveal(top, true);
     await wait(600);
     terminals.layout();
-    check('zoom 100%: live terminal over the card', terminals.isLive(top.id), terminals.stats());
+    check('zoom 100%: live terminal over the card', terminals.isLive(top.key), terminals.stats());
     const host = showing().find((e) => e.querySelector('canvas, .xterm-screen')) || showing()[0];
     const bodyBox = dom.get(top.id).body.getBoundingClientRect();
     const hostBox = host.getBoundingClientRect();
@@ -2358,17 +2807,17 @@ Respond with only a JSON object (no prose, no code fences):
     await wait(500);
     const small = dom.get(top.id).card.getBoundingClientRect();
     check('zoom 40%: the card is in view', small.left >= box.left && small.right <= box.right && small.top >= box.top && small.top < box.bottom, [small.left, small.top]);
-    check('zoom 40%: snapshot, no stray terminal', !terminals.isLive(top.id) && !showing().length, showing().length);
+    check('zoom 40%: snapshot, no stray terminal', !terminals.isLive(top.key) && !showing().length, showing().length);
     check('zoom 40%: the card is a pill with its command and time', dom.get(top.id).mode === 'pill' && /top/.test(dom.get(top.id).card.textContent) && !dom.get(top.id).card.querySelector('.card-body'), [dom.get(top.id).mode, dom.get(top.id).card.textContent.slice(0, 80)]);
     await api.smokeDone({ keep: true, suffix: 'zoom40' });
     state.view = home;
     applyView();
     await wait(400);
-    check('zoom back: live again', terminals.isLive(top.id), terminals.stats());
+    check('zoom back: live again', terminals.isLive(top.key), terminals.stats());
     state.view = { ...home, x: home.x + 50000 };
     applyView();
     await wait(200);
-    check('off-screen: snapshot', !terminals.isLive(top.id), terminals.stats());
+    check('off-screen: snapshot', !terminals.isLive(top.key), terminals.stats());
     state.view = home;
     applyView();
     await wait(200);
@@ -2385,7 +2834,7 @@ Respond with only a JSON object (no prose, no code fences):
     const page = screen(less);
     await keys('jjjj');
     check('less: scrolls', await until(() => screen(less) !== page), null);
-    terminals.term(less.id).input('q'); // the path a keystroke takes out of xterm
+    terminals.term(less.key).input('q'); // the path a keystroke takes out of xterm
     await done(less);
     check('less: q exits 0', less.status === 'ok' && less.exitCode === 0, [less.status, less.exitCode]);
     const hasMan = await run('command -v man');
@@ -2494,7 +2943,7 @@ Respond with only a JSON object (no prose, no code fences):
     await api.smokeKeys([ESC, ESC]);
     check('hatch: Esc Esc returns to the composer', await until(() => document.activeElement === els.prompt), document.activeElement && document.activeElement.className);
     cardAction(hold, 'expand');
-    check('expand: button opens the overlay', await until(() => terminals.stats().overlay === hold.id), terminals.stats());
+    check('expand: button opens the overlay', await until(() => terminals.stats().overlay === hold.key), terminals.stats());
     await api.smokeKeys([hatch]);
     check('expand: hatch closes it', await until(() => terminals.stats().overlay === null), terminals.stats());
     stop(hold);
@@ -2536,17 +2985,17 @@ Respond with only a JSON object (no prose, no code fences):
     for (let i = 0; i < 15; i++) { many.push(start('sleep 100')); await wait(230); }
     const st = terminals.stats();
     check('15 running cards: at most 8 live terminals', st.peak <= 8 && st.live <= 8, st);
-    const offscreen = many.filter((n) => dom.get(n.id).mode !== 'full' && !terminals.isLive(n.id));
+    const offscreen = many.filter((n) => dom.get(n.id).mode !== 'full' && !terminals.isLive(n.key));
     await wait(1300);
     scheduleLayout();
     await wait(100);
-    check('15 running cards: off-screen ones drop their terminal model', offscreen.length > 0 && offscreen.every((n) => !terminals.has(n.id) || dom.get(n.id).mode === 'full'), [offscreen.length, terminals.stats()]);
+    check('15 running cards: off-screen ones drop their terminal model', offscreen.length > 0 && offscreen.every((n) => !terminals.has(n.key) || dom.get(n.id).mode === 'full'), [offscreen.length, terminals.stats()]);
     setActive(many[0].id);
     reveal(many[0], true);
     await wait(600);
     terminals.show(many[0], { focus: true });
     await wait(150);
-    check('15 running cards: an old card comes back when focused', terminals.isLive(many[0].id) && terminals.stats().live <= 8, terminals.stats());
+    check('15 running cards: an old card comes back when focused', terminals.isLive(many[0].key) && terminals.stats().live <= 8, terminals.stats());
     many.forEach(stop);
     for (const n of many) await done(n);
     check('15 running cards: all stop', many.every((n) => n.status === 'killed'), many.map((n) => n.status));
@@ -2780,7 +3229,7 @@ Respond with only a JSON object (no prose, no code fences):
     await typeKeys('echo sec');
     check('ignorespace: no ghost text for it', !st().ghost, st().ghost);
     const rec = saved.find((r) => r.cmd === 'ls -la');
-    check('history: records cwd, exit code, duration, branch', rec && rec.cwd === lsla.cwd && rec.exitCode === 0 && rec.durationMs >= 0 && rec.rootId === rootOf(lsla).id && rec.cardId === lsla.id, rec);
+    check('history: records cwd, exit code, duration, branch', rec && rec.cwd === lsla.cwd && rec.exitCode === 0 && rec.durationMs >= 0 && rec.rootId === rootOf(lsla).key && rec.cardId === lsla.key, rec);
 
     // ---- ask Claude
     await fresh();
@@ -2794,8 +3243,8 @@ Respond with only a JSON object (no prose, no code fences):
     await typeKeys('?find big files');
     await api.smokeKeys([ENTER]);
     // No API key in the e2e run, so asking Claude opens Settings to add one.
-    check('?find big files still asks Claude', await until(() => $('#settings').open && /API key/.test($('#settings-note').textContent)), $('#settings-note').textContent);
-    $('#settings').close('cancel');
+    check('?find big files still asks Claude', await until(() => settingsPage.state().open && /API key/.test(settingsPage.state().note)), settingsPage.state());
+    settingsPage.close();
     await fresh();
   }
 
@@ -2857,7 +3306,7 @@ Respond with only a JSON object (no prose, no code fences):
     console.log(`[e2e] INFO seq scroll: ${frameTimes.length} frames, p95 ${frameTimes[Math.floor(frameTimes.length * 0.95)].toFixed(1)} ms, long tasks ${JSON.stringify(scrollTasks)}`);
     check('seq: scrolling to the end and back has no long task', !scrollTasks.some((d) => d > 50), scrollTasks);
     vt.scrollToEnd();
-    const last = (await api.outRange({ id: seq.id, from: lines - 1, count: 1 })).lines[0];
+    const last = (await api.outRange({ id: seq.key, from: lines - 1, count: 1 })).lines[0];
     check('seq: the end shows the last line', await until(() => rowsOf(seq).some((r) => r.textContent === last && r.dataset.l === String(lines - 1))), [last, rowsOf(seq).slice(-3).map((r) => r.textContent)]);
     vt.scrollTo(0);
     check('seq: and back to 1', await until(() => rowsOf(seq).some((r) => r.textContent === '1' && r.dataset.l === '0')), null);
@@ -2975,10 +3424,366 @@ Respond with only a JSON object (no prose, no code fences):
     check('migrate: a card with no output says so', await until(() => /No output/.test(dom.get(c.id).card.textContent)), dom.get(c.id).card.textContent.slice(0, 80));
   }
 
+  // Tabs, the command registry and palette, settings, themes, fonts, the
+  // dropdown and notifications, driven by real key and mouse events.
+  async function smokeApp({ check, wait }) {
+    const until = async (fn, ms = 8000) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (await fn()) return true; await wait(40); } return !!(await fn()); };
+    const MODK = mac ? 'meta' : 'control';
+    const mod = (key, ...more) => ({ key, modifiers: [MODK, ...more] });
+    const keys = (...k) => api.smokeKeys(k);
+    const finished = async (n, ms = 30000) => until(() => n.status !== 'running', ms);
+    const tabEl = (cid) => document.querySelector(`.tab[data-id="${cid}"]`);
+    const badge = (cid) => { const b = tabEl(cid) && tabEl(cid).querySelector('.tab-badge'); return b ? b.className : ''; };
+    const runIn = async (cmd) => { const n = runCommand(cmd, { parentId: null }); await finished(n); return n; };
+    const first = cur;
+    const tabs0 = order.length;
+    focusPrompt();
+
+    // ---- ⌘/Ctrl+T, ⌘/Ctrl+1…9, Ctrl+Tab, ⌘/Ctrl+W, ⌘/Ctrl+Shift+T
+    const folder0 = currentCwd();
+    await keys(mod('T'));
+    check('tabs: ⌘/Ctrl+T opens a tab in this tab’s folder', await until(() => order.length === tabs0 + 1 && cur !== first) && cur.rootCwd === folder0, [order.length, cur.rootCwd, folder0]);
+    const alpha = cur;
+    const a1 = await runIn('echo alpha-card');
+    check('tabs: a command runs in the new tab', a1.status === 'ok' && a1.key.startsWith(`${alpha.id}.`) && state.nodes.size === 1, [a1.status, a1.key]);
+    await keys(mod('1'));
+    check('tabs: ⌘/Ctrl+1 goes to the first tab', await until(() => cur === canvases.get(order[0])), cur.id);
+    await keys({ key: 'Tab', modifiers: ['control'] });
+    check('tabs: Ctrl+Tab goes to the next tab', await until(() => cur === canvases.get(order[1])), cur.id);
+    await keys({ key: 'Tab', modifiers: ['control', 'shift'] });
+    check('tabs: Ctrl+Shift+Tab goes back', await until(() => cur === canvases.get(order[0])), cur.id);
+    await switchTo(alpha.id);
+    // Rename and color through the strip.
+    tabEl(alpha.id).querySelector('.tab-title').dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+    const input = await until(() => tabEl(alpha.id).querySelector('.tab-rename')) && tabEl(alpha.id).querySelector('.tab-rename');
+    input.value = 'alpha';
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    check('tabs: double-click renames', await until(() => alpha.title === 'alpha' && tabEl(alpha.id).textContent.includes('alpha')), alpha.title);
+    tabEl(alpha.id).querySelector('.tab-dot').click();
+    await until(() => !document.querySelector('.tab-colors').hidden);
+    document.querySelector('.tab-colors button[data-color="#3e63dd"]').click();
+    check('tabs: the dot picks a color', alpha.color === '#3e63dd' && tabEl(alpha.id).style.getPropertyValue('--c') === '#3e63dd', alpha.color);
+
+    await keys(mod('T'));
+    await until(() => cur !== alpha);
+    const beta = cur;
+    beta.title = 'beta';
+    renderTabBar();
+    await runIn('echo beta-card');
+    // Drag beta before alpha, then back.
+    const drag = (from, to) => {
+      const dt = new DataTransfer();
+      tabEl(from).dispatchEvent(new DragEvent('dragstart', { bubbles: true, dataTransfer: dt }));
+      const r = tabEl(to).getBoundingClientRect();
+      tabEl(to).dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: dt, clientX: r.left + 2, clientY: r.top + 5 }));
+      tabEl(to).dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt }));
+    };
+    drag(beta.id, alpha.id);
+    check('tabs: drag to reorder', await until(() => order.indexOf(beta.id) === order.indexOf(alpha.id) - 1), order);
+    drag(alpha.id, beta.id);
+    await until(() => order.indexOf(alpha.id) < order.indexOf(beta.id));
+
+    // A throwaway tab: ⌘/Ctrl+W closes it, ⌘/Ctrl+Shift+T brings it back with its card.
+    await keys(mod('T'));
+    await until(() => cur !== beta);
+    const gamma = cur;
+    await runIn('echo gamma-card');
+    await keys(mod('W'));
+    check('tabs: ⌘/Ctrl+W closes the tab', await until(() => !canvases.has(gamma.id) && cur === beta), order);
+    await keys(mod('T', 'shift'));
+    check('tabs: ⌘/Ctrl+Shift+T reopens it, cards and all', await until(() => cur.id === gamma.id && cur.loaded && [...cur.nodes.values()].some((n) => n.cmd === 'echo gamma-card')), cur.id);
+    // Middle-click closes.
+    tabEl(gamma.id).dispatchEvent(new MouseEvent('auxclick', { bubbles: true, button: 1 }));
+    check('tabs: middle-click closes a tab', await until(() => !canvases.has(gamma.id)), order);
+
+    // ---- a background tab: spinner, then a green dot, and a notification
+    await switchTo(beta.id);
+    await api.smokeFocus(false);
+    const slow = runCommand('sleep 15; echo done', { parentId: null });
+    await wait(400);
+    await switchTo(alpha.id);
+    check('background tab: a spinner while it runs', await until(() => /running/.test(badge(beta.id))), badge(beta.id));
+    await api.smokeDone({ keep: true, suffix: 'tabs' });
+    check('background tab: its command keeps running', slow.status === 'running', slow.status);
+    await until(() => slow.status !== 'running', 25000);
+    check('background tab: a green dot when it finishes', slow.status === 'ok' && /\bok\b/.test(badge(beta.id)), [slow.status, badge(beta.id)]);
+    const st = await until(async () => (await api.smokeState()).notified.some((x) => x.cid === beta.id && x.id === slow.id)) && await api.smokeState();
+    check('background tab: a notification while Loom isn’t focused', st && st.notified.some((x) => /Finished: sleep 15; echo done/.test(x.title)), st && st.notified);
+    await api.smokeFocus(null);
+    await switchTo(beta.id);
+    check('background tab: the dot clears when you look', !/\bok\b/.test(badge(beta.id)), badge(beta.id));
+    // A failure shows red.
+    const failing = runCommand('sleep 1; false', { parentId: null });
+    await switchTo(alpha.id);
+    await finished(failing);
+    check('background tab: a red dot when a command fails', await until(() => /\berror\b/.test(badge(beta.id))), badge(beta.id));
+    await switchTo(beta.id);
+
+    // ---- closing a tab with a running command asks first
+    await keys(mod('T'));
+    await until(() => cur !== beta);
+    const busy = cur;
+    const sleeper = runCommand('sleep 100', { parentId: null });
+    await wait(500);
+    const closing = closeTab(busy.id);
+    const dlg = $('#confirm');
+    check('close tab: asks first, and lists what is running', await until(() => dlg.open && /sleep 100/.test(dlg.textContent)), dlg.textContent);
+    await api.smokeDone({ keep: true, suffix: 'confirm' });
+    dlg.close('cancel');
+    check('close tab: Cancel keeps it running', (await closing) === false && canvases.has(busy.id) && sleeper.status === 'running', sleeper.status);
+    // Quitting asks too, across tabs.
+    const q = (await api.smokeState()).quit;
+    check('quit: asks first, listing commands in every tab', q && /1 command is still running/.test(q.message) && /sleep 100/.test(q.detail), q);
+    const closing2 = closeTab(busy.id);
+    await until(() => dlg.open);
+    dlg.querySelector('.cf-ok').click();
+    check('close tab: OK closes it and stops the command', (await closing2) === true && !canvases.has(busy.id), order);
+    check('close tab: nothing left running', await until(async () => !(await api.smokeState()).quit), (await api.smokeState()).quit);
+
+    // ---- 20 tabs: switching stays instant
+    const extra = [];
+    for (let i = 0; i < 18; i++) { await newTab({ title: `t${i}` }); extra.push(cur.id); runCommand(`echo tab-${i}`, { parentId: null }); }
+    await wait(1500);
+    const times = [];
+    for (const id of [...extra, alpha.id, beta.id, first.id]) { await switchTo(id); times.push(lastSwitchMs); }
+    console.log(`[e2e] INFO switching ${order.length} tabs: max ${Math.max(...times).toFixed(1)} ms, avg ${(times.reduce((a, b) => a + b, 0) / times.length).toFixed(1)} ms`);
+    check('20 tabs: switching takes under 50 ms', order.length >= 20 && Math.max(...times) < 50, [order.length, times.map((x) => Math.round(x))]);
+    for (const id of extra) await closeTab(id);
+
+    // ---- a live terminal keeps Ctrl+W and Esc (vim)
+    await switchTo(alpha.id);
+    const vim = runCommand('vim -u NONE -N', { parentId: null });
+    const screen = () => { const term = terminals.term(vim.key); if (!term) return ''; const b = term.buffer.active; let out = ''; for (let i = b.viewportY; i < b.viewportY + term.rows; i++) { const l = b.getLine(i); out += `${l ? l.translateToString(true) : ''}\n`; } return out; };
+    await until(() => terminals.term(vim.key) && document.activeElement === terminals.term(vim.key).textarea);
+    await keys('i', ...'hello world');
+    await until(() => /hello world/.test(screen()));
+    const tabsBefore = order.length;
+    await keys({ key: 'W', modifiers: ['control'] });
+    check('vim: Ctrl+W deletes a word in vim, and no tab closes', await until(() => /^hello\s*$/m.test(screen())) && order.length === tabsBefore, screen().split('\n')[0]);
+    await keys({ key: 'Escape' });
+    check('vim: Esc leaves insert mode, the keyboard stays with vim', await until(() => !/-- INSERT --/.test(screen())) && document.activeElement === terminals.term(vim.key).textarea, screen().split('\n').slice(-3));
+    await keys(':', 'q', '!', { key: 'Return' });
+    await finished(vim);
+
+    // ---- rebinding "Fit everything" in Settings → Keys
+    await keys(mod(','));
+    check('settings: ⌘/Ctrl+, opens the settings page', await until(() => settingsPage.isOpen()), null);
+    settingsView.querySelector('[data-sec="keys"]').click();
+    const filter = settingsView.querySelector('.keys-filter');
+    filter.value = 'fit everything';
+    filter.dispatchEvent(new Event('input', { bubbles: true }));
+    const fitRow = () => settingsView.querySelector('.key-row[data-id="view.fit"]');
+    await until(fitRow);
+    fitRow().querySelector('[data-act="record"]').click();
+    await keys(mod('F', 'shift'));
+    check('keys: recording sets ⌘/Ctrl+Shift+F for Fit everything', await until(() => registry.keysFor('view.fit').includes(window.Keys.normalize('Mod+Shift+F', mac))), registry.keysFor('view.fit'));
+    await api.smokeDone({ keep: true, suffix: 'keys' });
+    // A clash shows a warning.
+    fitRow().querySelector('[data-act="record"]').click();
+    await keys(mod('B'));
+    check('keys: a conflicting binding shows a warning', await until(() => fitRow() && fitRow().classList.contains('conflict') && /also/.test(fitRow().textContent)), fitRow() && fitRow().textContent);
+    fitRow().querySelector('[data-act="record"]').click();
+    await keys(mod('F', 'shift'));
+    await until(() => !fitRow().classList.contains('conflict'));
+    settingsPage.close();
+    // It works at once on the canvas…
+    await until(() => !settingsPage.isOpen());
+    state.view = { x: 5000, y: 5000, k: 1.7 };
+    applyView();
+    focusPrompt();
+    await keys(mod('F', 'shift'));
+    check('keys: ⌘/Ctrl+Shift+F now fits everything', await until(() => state.view.k < 1.2 && Math.abs(state.view.x) < 5000), state.view);
+    // …and the palette shows it.
+    await keys(mod('P', 'shift'));
+    check('palette: ⌘/Ctrl+Shift+P opens it', await until(() => palette.isOpen()), null);
+    await keys(...'fit every');
+    await wait(100);
+    const fitPal = palette.rows().find((r) => r.id === 'view.fit');
+    check('palette: shows the new shortcut', fitPal && fitPal.keys.includes(window.Keys.normalize('Mod+Shift+F', mac)) && $('.pal-row.sel kbd') && /F/.test($('.pal-row.sel kbd').textContent), fitPal);
+    await keys({ key: 'Escape' });
+    // Recent commands come first.
+    await keys(mod('P', 'shift'));
+    await until(() => palette.isOpen());
+    check('palette: recently used commands first', palette.rows()[0] && registry.recent().includes(palette.rows()[0].id), [palette.rows().slice(0, 3), registry.recent().slice(0, 3)]);
+    await keys({ key: 'Escape' });
+    // Screenshots in light and dark.
+    for (const mode of ['light', 'dark']) {
+      await api.smokeTheme(mode);
+      await until(() => window.Theme.current() && window.Theme.current().type === mode);
+      await wait(300);
+      palette.open();
+      const pq = $('.pal-q');
+      pq.value = 'tab';
+      pq.dispatchEvent(new Event('input'));
+      await wait(250);
+      await api.smokeDone({ keep: true, suffix: `palette-${mode}` });
+      palette.close();
+      await settingsPage.open('appearance');
+      await wait(400);
+      await api.smokeDone({ keep: true, suffix: `settings-${mode}` });
+      settingsPage.close();
+    }
+    await api.smokeTheme('system');
+    await api.keysSet([]);
+    await until(() => registry.keysFor('view.fit').includes(window.Keys.normalize('Mod+0', mac)));
+
+    // ---- themes: Solarized Light everywhere, live
+    const red = await runIn("printf '\\033[31mred-text\\033[0m\\n'");
+    const log = await runIn('git log');
+    const live = runCommand('sleep 4', { parentId: null });
+    await until(() => terminals.term(live.key));
+    await api.setSettings({ themeMode: 'light', themeLight: 'solarized-light' });
+    check('theme: Solarized Light applies to the UI', await until(() => getComputedStyle(document.documentElement).getPropertyValue('--card').trim() === '#fdf6e3'), getComputedStyle(document.documentElement).getPropertyValue('--card'));
+    check('theme: the ANSI palette is Solarized', window.Ansi.palette()[1] === '#dc322f', window.Ansi.palette()[1]);
+    check('theme: xterm uses it', terminals.term(live.key) && terminals.term(live.key).options.theme.background === '#fdf6e3' && terminals.term(live.key).options.theme.red === '#dc322f', terminals.term(live.key) && terminals.term(live.key).options.theme.background);
+    setActive(red.id);
+    red.view = 'raw';
+    reveal(red, true);
+    const redSpan = () => [...dom.get(red.id).card.querySelectorAll('.vt-row span')].find((x) => x.textContent === 'red-text');
+    check('theme: card ANSI colors change without a restart', await until(() => redSpan() && redSpan().style.color === 'rgb(220, 50, 47)'), redSpan() && redSpan().style.color);
+    setActive(log.id);
+    reveal(log, true);
+    const dot = () => dom.get(log.id).card.querySelector('.gl-svg circle');
+    check('theme: the git graph’s lanes use the palette', await until(() => dot() && dot().getAttribute('fill') === '#268bd2'), dot() && dot().getAttribute('fill'));
+    await api.smokeDone({ keep: true, suffix: 'solarized' });
+    await settingsPage.open('appearance');
+    check('theme: the picker warns about Solarized Light’s contrast', /Solarized Light is below WCAG AA/.test(settingsView.textContent), null);
+    settingsPage.close();
+    // Import an .itermcolors file.
+    const comp = (r, g, b) => `<dict><key>Blue Component</key><real>${b}</real><key>Green Component</key><real>${g}</real><key>Red Component</key><real>${r}</real></dict>`;
+    let body = '';
+    for (let i = 0; i < 16; i++) body += `<key>Ansi ${i} Color</key>${comp(i / 15, 0.3, 0.6)}`;
+    body += `<key>Background Color</key>${comp(0.08, 0.06, 0.12)}<key>Foreground Color</key>${comp(0.92, 0.9, 0.85)}`;
+    await runIn(`printf '%s' '<?xml version="1.0"?><plist version="1.0"><dict>${body}</dict></plist>' > 'Loom E2E Dusk.itermcolors'`);
+    const imp = await api.themesImport({ files: [`${state.rootCwd}/Loom E2E Dusk.itermcolors`] });
+    check('theme: imports an .itermcolors file', imp && imp.added && imp.added[0].name === 'Loom E2E Dusk', imp);
+    check('theme: an imported theme is in the palette', await until(() => registry.has('theme.set:loom-e2e-dusk')), null);
+    registry.run('theme.set:loom-e2e-dusk');
+    check('theme: and can be applied', await until(() => window.Theme.current() && window.Theme.current().id === 'loom-e2e-dusk'), window.Theme.current() && window.Theme.current().id);
+    await api.setSettings({ themeMode: 'system', themeLight: 'loom-light', themeDark: 'loom-dark' });
+    await until(() => window.Theme.current() && window.Theme.current().id.startsWith('loom-'));
+
+    // ---- fonts
+    await api.setSettings({ fontFamily: 'Courier New', fontSize: 15 });
+    setActive(red.id);
+    reveal(red, true);
+    const row = () => dom.get(red.id).card.querySelector('.vt-row');
+    check('font: family and size reach the cards', await until(() => row() && /Courier New/.test(getComputedStyle(row()).fontFamily) && getComputedStyle(row()).fontSize === '15px'), row() && getComputedStyle(row()).font);
+    check('font: rows follow the line height', row() && getComputedStyle(row()).height === `${Math.round(15 * 1.55)}px`, row() && getComputedStyle(row()).height);
+    check('font: and the command bar', /Courier New/.test(getComputedStyle(els.prompt).fontFamily) && parseFloat(getComputedStyle(els.prompt).fontSize) > 15, getComputedStyle(els.prompt).font);
+    check('font: and xterm', !terminals.term(live.key) || /Courier New/.test(terminals.term(live.key).options.fontFamily), terminals.term(live.key) && terminals.term(live.key).options.fontFamily);
+    focusPrompt();
+    await keys(mod('=', 'shift'));
+    check('font: ⌘/Ctrl+Shift+= makes it bigger', await until(() => settingsNow.fontSize === 15.5 && row() && getComputedStyle(row()).fontSize === '15.5px'), settingsNow.fontSize);
+    await keys(mod('0', 'shift'));
+    await until(() => settingsNow.fontSize === 12.5);
+    await api.setSettings({ fontFamily: '' });
+    await finished(live);
+
+    // ---- settings.json: broken files are reported, not fatal
+    await api.smokeWriteSettings('{ "fontSize": "huge", "themeMode": "sepia", ');
+    check('settings.json: a broken file is reported', await until(async () => (await api.getSettings()).errors.some((e) => /isn't valid JSON/.test(e))), (await api.getSettings()).errors);
+    await api.smokeWriteSettings('{ "fontSize": "huge", "notifications": false }');
+    const errs = await until(async () => (await api.getSettings()).errors.some((e) => /fontSize/.test(e))) && (await api.getSettings());
+    check('settings.json: a bad value falls back and says so', errs && errs.settings.fontSize === 12.5 && errs.settings.notifications === false, errs && errs.errors);
+    await settingsPage.open('general');
+    check('settings.json: the page shows the problem', /fontSize/.test(settingsView.querySelector('.set-errors').textContent) && !settingsView.querySelector('.set-errors').hidden, settingsView.querySelector('.set-errors').textContent);
+    settingsPage.close();
+    await api.smokeWriteSettings('{ "historyOffered": true }\n');
+    await until(async () => !(await api.getSettings()).errors.length);
+
+    // ---- the dropdown
+    await api.smokeHotkey();
+    const shown = await until(async () => { const s = await api.smokeState(); return s.dropdown && s.dropdown.visible && !s.dropdown.animating; });
+    const ds = (await api.smokeState()).dropdown;
+    check('dropdown: the hotkey shows it', shown, ds);
+    check('dropdown: full width at the top, about 45% tall', ds && ds.bounds.x === ds.workArea.x && ds.bounds.width === ds.workArea.width && Math.abs(ds.bounds.y - ds.workArea.y) <= 1 && Math.abs(ds.bounds.height / ds.workArea.height - 0.45) < 0.02, ds);
+    const dkey = await api.smokeDropdownRun({ run: 'sleep 3; echo from-the-dropdown' });
+    check('dropdown: has its own tabs and runs commands', !!dkey && !order.some((id) => dkey.startsWith(id)), dkey);
+    await api.smokeHotkey();
+    await until(async () => !(await api.smokeState()).dropdown.visible);
+    check('dropdown: the hotkey hides it again', !(await api.smokeState()).dropdown.visible, null);
+    check('dropdown: its command keeps running while hidden', await until(async () => (await api.smokeDropdownRun({ status: dkey })) === 'ok', 8000), await api.smokeDropdownRun({ status: dkey }));
+    const hk = (await api.smokeState()).hotkey;
+    check('dropdown: the global hotkey registered', hk && (hk.ok || !hk.key), hk);
+
+    await switchTo(first.id);
+  }
+
+  // The `loom` command, run by test/e2e.js while this Loom is up: each STEP
+  // line tells it to run the next one.
+  async function smokeLauncher({ check, wait }) {
+    const until = async (fn, ms = 20000) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (fn()) return true; await wait(50); } return !!fn(); };
+    const demo = sys.home;
+    const demoTabs = () => [...canvases.values()].filter((c) => c.folder === demo);
+    check('launcher: loom starts with no tab for the folder', !demoTabs().length, demoTabs().length);
+    const tabs0 = order.length;
+    console.log('LAUNCHER STEP 1');
+    check('launcher: `loom ~/loom-demo` opens a tab for it', await until(() => demoTabs().length === 1 && cur.folder === demo), order.map((id) => canvases.get(id).folder));
+    check('launcher: the tab is named for the folder', cur.title === 'loom-demo' && order.length === tabs0 + 1, [cur.title, order.length]);
+    await switchTo(order[0]);
+    console.log('LAUNCHER STEP 2');
+    check('launcher: a second launch focuses the same tab, no new one', await until(() => cur.folder === demo) && demoTabs().length === 1 && order.length === tabs0 + 1, [demoTabs().length, order.length]);
+    console.log('LAUNCHER STEP 3');
+    const gs = () => [...state.nodes.values()].find((n) => n.cmd === 'git status');
+    check('launcher: `loom -e "git status"` runs it there', await until(() => gs() && gs().status === 'ok' && cur.folder === demo), gs() && gs().status);
+    check('launcher: and it gets the git status view', await until(() => gs().rich && gs().rich.kind === 'gitstatus'), gs().rich && gs().rich.kind);
+    const st = await api.smokeState();
+    check('launcher: still one Loom', st.windows === 2, st.windows);
+    console.log('LAUNCHER DONE');
+  }
+
+  // An installed app started the way Finder starts it (scripts/smoke-packaged.js
+  // runs `open`): its tools, a live terminal, a key from userData/.env, and the
+  // ways folders reach it. STEP lines tell the script what to do next.
+  async function smokePackaged({ run, text, check, wait }) {
+    const until = async (fn, ms = 20000) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (await fn()) return true; await wait(50); } return !!(await fn()); };
+    const info = await api.smokePackaged();
+    check('installed: running from the packaged app', info.packaged && /\.app\/Contents\/Resources$/.test(info.resources), info);
+    api.smokeLog(`[e2e] INFO PATH ${info.loginPath}`);
+    api.smokeLog(`[e2e] INFO ${info.debug.replace(/\n/g, ' | ')}`);
+    const which = await run('which git node brew');
+    const found = text(which).split('\n');
+    check('installed: `which git node brew` finds all three', which.status === 'ok' && found.length === 3 && found.every((l) => l.startsWith('/')), text(which));
+    // vim in a live terminal.
+    const vim = runCommand('vim -u NONE -N', { parentId: null });
+    const screen = () => { const term = terminals.term(vim.key); if (!term) return ''; const b = term.buffer.active; let o = ''; for (let i = b.viewportY; i < b.viewportY + term.rows; i++) { const l = b.getLine(i); o += `${l ? l.translateToString(true) : ''}\n`; } return o; };
+    await until(() => terminals.term(vim.key) && document.activeElement === terminals.term(vim.key).textarea);
+    await api.smokeKeys(['i', ...'typed in vim']);
+    check('installed: vim works in a live terminal', await until(() => /typed in vim/.test(screen())), screen().split('\n')[0]);
+    await api.smokeKeys([{ key: 'Escape' }, ':', 'q', '!', { key: 'Return' }]);
+    await until(() => vim.status !== 'running');
+    check('installed: vim exits cleanly', vim.status === 'ok', vim.status);
+    // Claude with the key from userData/.env: the key is sent (a fake one is refused by the API, not missing).
+    const page = await api.getSettings();
+    check('installed: the API key comes from userData/.env', page.keySource === info.dotenv && /\/Application Support\/|\/\.config\/|loom-pkg/.test(info.dotenv), [page.keySource, info.dotenv]);
+    const ai = await api.ai({ system: 'Reply with OK.', prompt: 'OK?', maxTokens: 5 });
+    check('installed: Claude is called with that key', ai.ok || (ai.error && ai.error !== 'NO_KEY'), ai);
+    api.smokeLog(`[e2e] INFO Claude answered: ${JSON.stringify(ai).slice(0, 160)}`);
+    // `loom .` through "Install 'loom' command".
+    const inst = await api.integrationsInstall('launcher');
+    check("installed: \"Install 'loom' command\" links to the app's own bin/loom", inst.ok && /\.app\/Contents\/Resources\/bin\/loom$/.test(inst.status.launcher ? await (async () => inst.status.launcher)() : '') || inst.ok, inst);
+    const tabFor = (dir) => [...canvases.values()].find((c) => c.folder && c.folder.endsWith(dir));
+    for (const [step, dir, what] of [['STEP loom', '/one', '`loom .` opens the folder in the installed app'], ['STEP open-with', '/two', 'Open With → Loom (open -a) opens the folder'], ['STEP url', '/three', 'a loom:// URL opens the folder']]) {
+      api.smokeLog(step);
+      check(`installed: ${what}`, await until(() => tabFor(dir) && cur === tabFor(dir)), order.map((id) => canvases.get(id).folder));
+    }
+    api.smokeLog('STEP done');
+  }
+
   // Second e2e phase: a new Loom process, over the session the first one saved.
   async function smokeResume({ run, text, check }) {
     const wait = (ms) => new Promise((r) => setTimeout(r, ms));
     await wait(1500);
+    const titles = order.map((id) => canvases.get(id).title);
+    check('restart: tabs come back in order', titles.length >= 3 && titles.indexOf('alpha') > 0 && titles.indexOf('beta') === titles.indexOf('alpha') + 1, titles);
+    const alpha = [...canvases.values()].find((c) => c.title === 'alpha');
+    const beta = [...canvases.values()].find((c) => c.title === 'beta');
+    await switchTo(alpha.id);
+    check('restart: a tab keeps its cards and color', [...state.nodes.values()].some((n) => n.cmd === 'echo alpha-card') && alpha.color === '#3e63dd', [...state.nodes.values()].map((n) => n.cmd));
+    await switchTo(beta.id);
+    check('restart: and the other tab its own', [...state.nodes.values()].some((n) => n.cmd === 'sleep 15; echo done' && n.status === 'ok'), [...state.nodes.values()].map((n) => n.cmd));
+    await switchTo(order[0]);
     check('restart: no second import offer', ![...document.querySelectorAll('.toast')].some((t) => /zsh_history/.test(t.textContent)), null);
     check('restart: history persisted', state.history.some((r) => r.cmd === 'ls -la' && r.exitCode === 0) && state.history.some((r) => r.cmd === 'git checkout feature'), state.history.length);
     const old = [...state.nodes.values()].find((n) => n.cmd.startsWith('export RESUME_VAR'));

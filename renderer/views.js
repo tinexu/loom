@@ -229,9 +229,11 @@
     return root;
   }
 
-  const LANE_COLORS = ['#7aa8f5', '#a3d983', '#e8c278', '#c792ea', '#6cd0d0', '#f07178', '#f5a97f', '#9cc0ff'];
+  // Lane colors come from the active theme's palette.
+  const laneColors = () => (g.Theme ? g.Theme.lanes() : ['#7aa8f5', '#a3d983', '#e8c278', '#c792ea', '#6cd0d0', '#f07178', '#f5a97f', '#9cc0ff']);
 
   function renderGitLog(data, ctx) {
+    const LANE_COLORS = laneColors();
     const ROW = 30;
     const LANE = 14;
     const commits = data.commits;

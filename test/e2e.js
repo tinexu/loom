@@ -13,6 +13,10 @@ const { spawnSync, spawn } = require('child_process');
 
 const electron = require('electron');
 const repo = path.join(__dirname, '..');
+// E2E_APP=<the packaged binary> runs everything against a built app
+// (Loom.app/Contents/MacOS/Loom, the AppImage, /opt/Loom/loom) instead of the checkout.
+const APP = process.env.E2E_APP || '';
+const appArgs = (...rest) => (APP ? [APP, rest] : [electron, [repo, ...rest]]);
 const RC = (shell) => `
 alias loomalias='echo alias-ok'
 loomfn() { echo fn-ok; }
@@ -69,7 +73,8 @@ function oldSession(cwd) {
   };
 }
 
-function launch(shell, fx, extra) {
+// onLine(line) sees each line of output as it comes.
+function launch(shell, fx, extra, onLine) {
   const env = {
     ...process.env,
     SHELL: spawnSync('which', [shell]).stdout.toString().trim(),
@@ -77,19 +82,28 @@ function launch(shell, fx, extra) {
     LOOM_SMOKE: path.join(fx.root, 'smoke.png'),
     LOOM_SMOKE_CWD: fx.cwd,
     LOOM_SMOKE_USERDATA: path.join(fx.root, 'userData'),
+    LOOM_SMOKE_HOTKEY: 'Control+Alt+Shift+F12',
     ...extra,
   };
   delete env.ELECTRON_RUN_AS_NODE;
   delete env.ZDOTDIR;
-  const args = [repo];
+  const [bin, args] = appArgs();
   if ((process.getuid && process.getuid() === 0) || process.env.E2E_NO_SANDBOX) args.push('--no-sandbox');
   const linux = process.platform === 'linux';
-  const [cmd, argv] = linux ? ['xvfb-run', ['-a', electron, ...args]] : [electron, args];
+  const [cmd, argv] = linux ? ['xvfb-run', ['-a', bin, ...args]] : [bin, args];
   return new Promise((resolve) => {
     const child = spawn(cmd, argv, { env, stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '';
     const timer = setTimeout(() => { out += '\n[e2e] FAIL timed out\n'; child.kill('SIGKILL'); }, 420000);
-    child.stdout.on('data', (d) => { out += d; });
+    let partial = '';
+    child.stdout.on('data', (d) => {
+      out += d;
+      if (!onLine) return;
+      partial += d;
+      const lines = partial.split('\n');
+      partial = lines.pop();
+      for (const l of lines) onLine(l);
+    });
     child.stderr.on('data', (d) => { out += d; });
     child.on('close', () => { clearTimeout(timer); resolve(out); });
   });
@@ -117,9 +131,10 @@ function report(label, out) {
     const histHash = ['.zsh_history', '.bash_history'].map((f) => hash(path.join(fx.home, f))).join();
     failed += report(shell, await launch(shell, fx, {}));
     failed += report(`${shell} (restart)`, await launch(shell, fx, { LOOM_SMOKE_RESUME: '1' }));
-    const saved = fs.readFileSync(path.join(fx.root, 'userData', 'session.json'), 'utf8');
-    if (saved.includes('loom-canary-hunter2')) { console.log(`${shell} FAIL typed secret found in session.json`); failed++; }
-    else console.log(`${shell} PASS typed secret isn't in session.json`);
+    const canvasDir = path.join(fx.root, 'userData', 'canvases');
+    const saved = fs.readdirSync(canvasDir).map((f) => fs.readFileSync(path.join(canvasDir, f), 'utf8')).join('\n');
+    if (saved.includes('loom-canary-hunter2')) { console.log(`${shell} FAIL typed secret found in a saved canvas`); failed++; }
+    else console.log(`${shell} PASS typed secret isn't in any saved canvas`);
     const hist = fs.readFileSync(path.join(fx.root, 'userData', 'history.jsonl'), 'utf8');
     const histOk = !hist.includes('secret-space') && !hist.includes('loom-canary-hunter2') && hist.includes('"cmd":"ls -la"');
     console.log(`${shell} ${histOk ? 'PASS' : 'FAIL'} history.jsonl has ls -la and no leading-space command or typed secret`);
@@ -127,23 +142,65 @@ function report(label, out) {
     const untouched = ['.zsh_history', '.bash_history'].map((f) => hash(path.join(fx.home, f))).join() === histHash;
     console.log(`${shell} ${untouched ? 'PASS' : 'FAIL'} ~/.zsh_history and ~/.bash_history unchanged`);
     if (!untouched) failed++;
+    // ---- the `loom` command, against the Loom that's running
+    const L = require('../lib/launcher');
+    const bin = path.join(fx.home, '.local', 'bin');
+    // A built app is linked to its own bin/loom, as "Install 'loom' command" does.
+    const bundled = APP && (process.platform === 'darwin' ? path.join(APP, '..', '..', 'Resources', 'bin', 'loom') : process.env.APPIMAGE ? null : path.join(path.dirname(APP), 'resources', 'bin', 'loom'));
+    const inst = bundled ? L.install({ link: bundled, dirs: [bin], home: fx.home, pathEnv: bin })
+      : L.install({ script: APP ? L.launcherScript({ app: APP }) : L.launcherScript({ app: electron, appDir: repo }), dirs: [bin], home: fx.home, pathEnv: bin });
+    const launchEnv = {
+      ...process.env, HOME: fx.home, PATH: `${bin}:${process.env.PATH}`, SHELL: spawnSync('which', [shell]).stdout.toString().trim(),
+      LOOM_SMOKE: path.join(fx.root, 'smoke.png'), LOOM_SMOKE_CWD: fx.cwd, LOOM_SMOKE_USERDATA: path.join(fx.root, 'userData'),
+    };
+    delete launchEnv.ELECTRON_RUN_AS_NODE;
+    let launcherQuick = true;
+    let secondExit = null;
+    const steps = {
+      'LAUNCHER STEP 1': () => {
+        const t0 = Date.now();
+        const r = spawnSync('/bin/sh', ['-c', 'loom ~/loom-demo'], { cwd: fx.home, env: launchEnv });
+        if (r.status !== 0 || Date.now() - t0 > 1500) launcherQuick = false;
+      },
+      // A second Loom started directly: it hands over its arguments and exits.
+      'LAUNCHER STEP 2': () => {
+        const t0 = Date.now();
+        const [b2, a2] = appArgs(fx.cwd);
+        const c = spawn(b2, a2, { env: launchEnv, stdio: 'ignore' });
+        c.on('exit', (code) => { secondExit = { code, ms: Date.now() - t0 }; });
+      },
+      'LAUNCHER STEP 3': () => { spawnSync('/bin/sh', ['-c', 'loom -e "git status"'], { cwd: fx.cwd, env: launchEnv }); },
+    };
+    failed += report(`${shell} (launcher)`, await launch(shell, fx, { LOOM_SMOKE_LAUNCHER: '1' }, (line) => {
+      const step = Object.keys(steps).find((k) => line.includes(k));
+      if (step) steps[step]();
+    }));
+    console.log(`${shell} ${inst.onPath && launcherQuick ? 'PASS' : 'FAIL'} launcher: installed in ${inst.file}, and \`loom\` returns at once`);
+    if (!(inst.onPath && launcherQuick)) failed++;
+    const secondOk = secondExit && secondExit.code === 0 && secondExit.ms < 10000;
+    console.log(`${shell} ${secondOk ? 'PASS' : 'FAIL'} launcher: a second Loom forwards its arguments and exits (${secondExit ? `${secondExit.ms} ms` : 'still running'})`);
+    if (!secondOk) failed++;
+
     // ---- migration of an old session
     const mig = path.join(fx.root, 'userData-old');
     fs.mkdirSync(mig, { recursive: true });
     fs.writeFileSync(path.join(mig, 'session.json'), JSON.stringify(oldSession(fx.cwd)));
     failed += report(`${shell} (migrate)`, await launch(shell, fx, { LOOM_SMOKE_MIGRATE: '1', LOOM_SMOKE_USERDATA: mig }));
-    const after = JSON.parse(fs.readFileSync(path.join(mig, 'session.json'), 'utf8'));
-    const logs = ['1', '2'].every((id) => fs.existsSync(path.join(mig, 'outputs', `${id}.log`)));
-    const migOk = after.v === 2 && !JSON.stringify(after).includes('"segs"') && logs && fs.existsSync(path.join(mig, 'session.v1.json'))
-      && fs.readFileSync(path.join(mig, 'outputs', '1.log'), 'utf8').startsWith('old output line 1');
-    console.log(`${shell} ${migOk ? 'PASS' : 'FAIL'} migrate: session.json is metadata only, output moved to files, old file kept`);
+    const tabsJson = JSON.parse(fs.readFileSync(path.join(mig, 'tabs.json'), 'utf8'));
+    const cid = tabsJson.windows.main.order[0];
+    const after = JSON.parse(fs.readFileSync(path.join(mig, 'canvases', `${cid}.json`), 'utf8'));
+    const logs = ['1', '2'].every((id) => fs.existsSync(path.join(mig, 'outputs', `${cid}.${id}.log`)));
+    const migOk = after.v === 3 && after.nodes.length === 3 && !JSON.stringify(after).includes('"segs"') && logs
+      && fs.existsSync(path.join(mig, 'session.v1.json')) && fs.existsSync(path.join(mig, 'session.pre-tabs.json')) && !fs.existsSync(path.join(mig, 'session.json'))
+      && fs.readFileSync(path.join(mig, 'outputs', `${cid}.1.log`), 'utf8').startsWith('old output line 1');
+    console.log(`${shell} ${migOk ? 'PASS' : 'FAIL'} migrate: the old session.json is the first tab, output in files, old files kept`);
     if (!migOk) failed++;
     const outFiles = fs.readdirSync(path.join(fx.root, 'userData', 'outputs')).length;
-    const sessText = fs.readFileSync(path.join(fx.root, 'userData', 'session.json'), 'utf8');
-    const sess = JSON.parse(sessText);
-    const perCard = sessText.length / sess.nodes.length;
+    const sessText = saved;
+    const cards = fs.readdirSync(canvasDir).reduce((a, f) => a + JSON.parse(fs.readFileSync(path.join(canvasDir, f), 'utf8')).nodes.length, 0);
+    const perCard = sessText.length / cards;
     const small = !sessText.includes('"segs"') && !sessText.includes('alias-ok') && !sessText.includes('1.00001e+06') && perCard < 1000 && outFiles > 10;
-    console.log(`${shell} ${small ? 'PASS' : 'FAIL'} session.json holds no output (${sessText.length} bytes for ${sess.nodes.length} cards, ${outFiles} output files)`);
+    console.log(`${shell} ${small ? 'PASS' : 'FAIL'} saved canvases hold no output (${sessText.length} bytes for ${cards} cards, ${outFiles} output files)`);
     if (!small) failed++;
     if (process.env.E2E_SHOTS) {
       fs.mkdirSync(process.env.E2E_SHOTS, { recursive: true });

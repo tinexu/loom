@@ -1,0 +1,33 @@
+#!/bin/sh
+# LOOM-LAUNCHER v1 (installed app)
+# Opens a folder or runs a command in Loom:
+#   loom [folder] [--new-tab] [--dropdown] [-e command [args...]]
+# Ships inside Loom (Loom.app/Contents/Resources/bin/loom on macOS,
+# resources/bin/loom on Linux). "Install 'loom' command" links to it, and it
+# finds the app from where it really is, so an update that replaces the app
+# keeps the link working.
+unset ELECTRON_RUN_AS_NODE
+
+self=$0
+while [ -L "$self" ]; do
+  link=$(readlink "$self")
+  case $link in
+    /*) self=$link ;;
+    *) self=$(dirname "$self")/$link ;;
+  esac
+done
+res=$(cd "$(dirname "$self")/.." && pwd)
+
+if [ -x "$res/../MacOS/Loom" ]; then
+  app="$res/../MacOS/Loom"
+elif [ -n "$APPIMAGE" ] && [ -x "$APPIMAGE" ]; then
+  app=$APPIMAGE
+elif [ -x "$res/../loom" ]; then
+  app="$res/../loom"
+else
+  echo "loom: can't find the Loom app next to $self" >&2
+  exit 1
+fi
+
+nohup "$app" --cwd "$PWD" "$@" >/dev/null 2>&1 &
+exit 0

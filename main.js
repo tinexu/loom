@@ -5,8 +5,13 @@
 // git and Claude calls for the renderer. The renderer never touches Node directly.
 // Every card's output is recorded here (lib/outputs.js); the renderer asks for
 // the lines it shows, and only watched running cards stream to it (lib/relay.js).
+// Cards are keyed "<canvas>.<card>": each tab is a canvas, saved on its own
+// (lib/tabs.js), and its cards' events go to the window that shows it.
 
-const { app, BrowserWindow, ipcMain, safeStorage, shell, nativeTheme, clipboard, dialog, MessageChannelMain } = require('electron');
+const {
+  app, BrowserWindow, ipcMain, safeStorage, shell, nativeTheme, clipboard, dialog, MessageChannelMain,
+  Menu, Notification, globalShortcut, screen, session: electronSession, nativeImage,
+} = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -17,15 +22,23 @@ const { createShellInfo } = require('./lib/shellinfo');
 const { createHistory, parseZshHistory, parseBashHistory } = require('./lib/history');
 const { createOutputs } = require('./lib/outputs');
 const { createRelay } = require('./lib/relay');
+const { createTabStore, migrateLegacy } = require('./lib/tabs');
+const { parseArgs, userArgs, hasRequest } = require('./lib/args');
+const Settings = require('./lib/settings');
+const Themes = require('./lib/themes');
+const Launcher = require('./lib/launcher');
+const Env = require('./lib/env');
 const completer = require('./lib/complete');
 
 const isWin = process.platform === 'win32';
+const isMac = process.platform === 'darwin';
 const SMOKE = process.env.LOOM_SMOKE || '';
 const BENCH = SMOKE ? process.env.LOOM_BENCH || '' : '';
 const PROC_START = Date.now() - process.uptime() * 1000;
 const GB = 1024 ** 3;
 const COPY_MAX = 32 * 1024 * 1024;
-const DEFAULT_MODEL = 'claude-sonnet-5-5';
+const REPO = 'tinexu/loom';
+const REPO_URL = `https://github.com/${REPO}`;
 
 if (SMOKE) {
   // A fixed LOOM_SMOKE_USERDATA lets the e2e run restart Loom over its own session.
@@ -34,14 +47,24 @@ if (SMOKE) {
   if (!BENCH) app.disableHardwareAcceleration();
 }
 
-let win = null;
+// ---------------------------------------------------------------- single instance
+// A second `loom` hands its arguments to this one and exits.
+const launchArgs = parseArgs(userArgs(process.argv, { defaultApp: !!process.defaultApp }), { cwd: process.cwd() });
+const primary = app.requestSingleInstanceLock({ args: launchArgs });
+if (!primary) app.quit();
+
+let mainWin = null;
+let dropWin = null;
 let loginPath = process.env.PATH || '';
 let sessions = null;
 let shellInfo = null;
 let history = null;
 let outputs = null;
 let relay = null;
+let tabs = null;
 const procs = new Map();
+const owners = new Map(); // canvas id -> webContents of the window showing it
+const runningCards = new Map(); // key -> { command, startedAt }
 
 // ---------------------------------------------------------------- storage
 const file = (name) => path.join(app.getPath('userData'), name);
@@ -49,21 +72,84 @@ const file = (name) => path.join(app.getPath('userData'), name);
 function readJSON(p, fallback) {
   try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return fallback; }
 }
-function writeJSON(p, value) {
+function writeJSON(p, value, pretty = false) {
   fs.mkdirSync(path.dirname(p), { recursive: true });
   const tmp = `${p}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(value));
+  fs.writeFileSync(tmp, JSON.stringify(value, null, pretty ? 2 : 0));
   fs.renameSync(tmp, p);
 }
-const settings = () => readJSON(file('settings.json'), {});
+const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
+
+// ---------------------------------------------------------------- settings
+// settings.json is validated on every read; errors go to the Settings page.
+let conf = { value: { ...Settings.DEFAULTS }, errors: [] };
+let confText = '';
+const settings = () => conf.value;
+
+function readSettings() {
+  conf = Settings.load(file('settings.json'), conf.value);
+  try { confText = fs.readFileSync(file('settings.json'), 'utf8'); } catch { confText = ''; }
+}
+function writeSettings(value) {
+  const text = `${JSON.stringify(Settings.toFile(value), null, 2)}\n`;
+  writeJSON(file('settings.json'), Settings.toFile(value), true);
+  confText = text;
+  conf = { value, errors: [] };
+}
+// The file changed, from Loom or from an editor: apply it everywhere.
+function applySettings(prev = {}) {
+  const s = settings();
+  if (outputs) outputs.setCaps(capsFromSettings());
+  if (sessions) {
+    if (s.realPager !== prev.realPager) sessions.dropIdle();
+    sessions.setShell(pickShell(), s.shellArgs);
+  }
+  if (s.dropdownHotkey !== prev.dropdownHotkey) registerHotkey();
+  broadcast('settings:changed', pageSettings());
+}
+function watchSettings() {
+  const dir = app.getPath('userData');
+  try {
+    fs.watch(dir, debounce(() => {
+      let text = '';
+      try { text = fs.readFileSync(file('settings.json'), 'utf8'); } catch { /* removed */ }
+      if (text === confText) return;
+      const prev = settings();
+      readSettings();
+      applySettings(prev);
+    }, 150));
+  } catch { /* no watching: changes apply from the Settings page */ }
+}
+
+// .env: the project's when running from a checkout, userData/.env in an
+// installed app (never one inside the app bundle). Its values stay with Loom;
+// they don't go into the environment of the shells in your tabs.
+const dotenvFile = () => Env.dotenvPath({ packaged: app.isPackaged, appPath: app.getAppPath(), userData: app.getPath('userData') });
+const dotenv = () => Env.readDotenv(dotenvFile());
 
 function getApiKey() {
   if (process.env.ANTHROPIC_API_KEY) return process.env.ANTHROPIC_API_KEY;
+  const fromFile = dotenv().ANTHROPIC_API_KEY;
+  if (fromFile) return fromFile;
   const s = settings();
   if (!s.apiKey) return null;
   try {
     return s.keyEncrypted ? safeStorage.decryptString(Buffer.from(s.apiKey, 'base64')) : s.apiKey;
   } catch { return null; }
+}
+
+function pageSettings() {
+  return {
+    settings: Settings.forPage(settings()),
+    errors: conf.errors,
+    hasKey: !!getApiKey(),
+    keyFromEnv: !!(process.env.ANTHROPIC_API_KEY || dotenv().ANTHROPIC_API_KEY),
+    keySource: process.env.ANTHROPIC_API_KEY ? 'environment' : dotenv().ANTHROPIC_API_KEY ? dotenvFile() : null,
+    dotenv: dotenvFile(),
+    shell: pickShell(),
+    hotkey: hotkeyStatus,
+    file: file('settings.json'),
+  };
 }
 
 // ---------------------------------------------------------------- shell
@@ -74,23 +160,16 @@ function pickShell() {
   return ['bash', 'zsh', 'sh', 'dash', 'ksh'].includes(path.basename(s)) ? s : '/bin/bash';
 }
 
-// Apps launched from the Dock/Finder get a minimal PATH. Ask the user's
-// shell for the real one once at startup.
-function resolveLoginPath() {
-  if (isWin) return Promise.resolve();
-  const probe = (flags) => new Promise((resolve) => {
-    execFile(pickShell(), [flags, 'printf "__LOOM__%s__LOOM__" "$PATH"'],
-      { timeout: 6000, env: process.env }, (_err, out) => {
-        const m = /__LOOM__(.*?)__LOOM__/s.exec(out || '');
-        resolve(m && m[1].includes('/') ? m[1] : null);
-      });
-  });
-  return probe('-ilc').then((p) => p || probe('-lc')).then((p) => {
-    if (p) {
-      const merged = new Set([...p.split(':'), ...(process.env.PATH || '').split(':')].filter(Boolean));
-      loginPath = [...merged].join(':');
-    }
-  });
+// Apps launched from Finder, the Dock or a desktop launcher get a minimal
+// PATH. Ask the user's login shell for theirs (4 s at most: a slow or broken
+// rc file falls back), and add the folders tools usually live in (Homebrew,
+// nvm, pyenv, cargo…) that exist. Also a UTF-8 locale, which apps don't get.
+async function resolveLoginPath() {
+  if (isWin) return;
+  Object.assign(process.env, Env.localeEnv(process.env));
+  const probed = await Env.probeLoginPath(pickShell(), { timeout: 4000 });
+  if (!probed) console.warn('loom: the login shell didn\'t report its PATH in time; using the usual folders');
+  loginPath = Env.mergePath(probed, process.env.PATH, Env.fallbackDirs(os.homedir()));
 }
 
 const envDir = () => file('envs');
@@ -120,11 +199,21 @@ function cmdEnv({ plain = false } = {}) {
   return env;
 }
 
-const send = (channel, msg) => {
-  if (!win || win.isDestroyed()) return false;
-  win.webContents.send(channel, msg);
+// ---------------------------------------------------------------- windows and messages
+const windows = () => [mainWin, dropWin].filter((w) => w && !w.isDestroyed());
+function broadcast(channel, msg) {
+  for (const w of windows()) w.webContents.send(channel, msg);
+}
+const cidOf = (key) => String(key).split('.')[0];
+// A card's events go to the window showing its canvas.
+function sendCard(key, channel, msg) {
+  const wc = owners.get(cidOf(key)) || (mainWin && !mainWin.isDestroyed() ? mainWin.webContents : null);
+  if (!wc || wc.isDestroyed()) return false;
+  wc.send(channel, msg);
   return true;
-};
+}
+const kindOf = (wc) => (dropWin && !dropWin.isDestroyed() && wc === dropWin.webContents ? 'dropdown' : 'main');
+const winOf = (wc) => BrowserWindow.fromWebContents(wc);
 
 const expandHome = (p) => (p === '~' || p.startsWith('~/') ? path.join(os.homedir(), p.slice(1)) : p);
 
@@ -143,6 +232,7 @@ function startSessions() {
   sessions = createSessions({
     pty,
     shell: pickShell(),
+    shellArgs: settings().shellArgs,
     envDir: envDir(),
     env: () => {
       const env = { ...cmdEnv({ plain: true }), TERM_PROGRAM: 'Loom' };
@@ -162,20 +252,19 @@ function startSessions() {
 }
 
 // ---------------------------------------------------------------- output
-const capsFromSettings = () => {
-  const s = settings();
-  return { card: (Number(s.outputCapGB) || 1) * GB, total: (Number(s.outputTotalGB) || 5) * GB };
-};
+const capsFromSettings = () => ({ card: settings().outputCapGB * GB, total: settings().outputTotalGB * GB });
 
 function startOutputs() {
+  const c = capsFromSettings();
   outputs = createOutputs({
     dir: file('outputs'),
-    ...(() => { const c = capsFromSettings(); return { capCard: c.card, capTotal: c.total }; })(),
-    onCapped: (id, cap) => send('out:capped', { id, cap }),
-    onEvicted: (id) => send('out:evicted', { id }),
+    capCard: c.card,
+    capTotal: c.total,
+    onCapped: (id, cap) => sendCard(id, 'out:capped', { id, cap }),
+    onEvicted: (id) => sendCard(id, 'out:evicted', { id }),
   });
   relay = createRelay({
-    send: (id, data) => send('cmd:data', { id, data }),
+    send: (id, data) => sendCard(id, 'cmd:data', { id, data }),
     pause: (id, on) => {
       if (sessions && sessions.owns(id)) { sessions.pause(id, on); return; }
       const p = procs.get(id);
@@ -195,15 +284,20 @@ function cardOutput(id, text) {
 // What's left for the renderer goes first, then the exit with the output's shape.
 function cardExit(msg) {
   relay.end(msg.id);
+  runningCards.delete(msg.id);
   const out = outputs.end(msg.id);
-  send('cmd:exit', { ...msg, out });
+  sendCard(msg.id, 'cmd:exit', { ...msg, out });
 }
 
 const tmpFile = (name) => path.join(os.tmpdir(), `loom-${process.pid}-${name}`);
+const validKey = (k) => typeof k === 'string' && /^c[0-9a-f]{8}\.\d+$/.test(k);
 
-ipcMain.handle('cmd:run', async (_e, req) => {
+ipcMain.handle('cmd:run', async (e, req) => {
+  if (!validKey(req.id)) throw new Error('bad card key');
+  owners.set(cidOf(req.id), e.sender);
   outputs.begin(req.id);
   relay.start(req.id, { watch: req.watch !== false });
+  runningCards.set(req.id, { command: req.command, startedAt: Date.now() });
   // A card-to-card pipe: the source's visible text, streamed to a file.
   if (req.stdinFrom != null) {
     const dest = tmpFile(`stdin-${req.id}-${Date.now()}`);
@@ -286,7 +380,7 @@ function runSpawned({ id, command, cwd, stdin, stdinPath }) {
   return { pid: child.pid };
 }
 
-ipcMain.handle('cmd:kill', (_e, id) => {
+function killCard(id) {
   if (sessions && sessions.owns(id)) return sessions.kill(id);
   const p = procs.get(id);
   if (!p) return false;
@@ -300,7 +394,8 @@ ipcMain.handle('cmd:kill', (_e, id) => {
   setTimeout(() => procs.has(id) && sig('SIGTERM'), 1000);
   setTimeout(() => procs.has(id) && sig('SIGKILL'), 2500);
   return true;
-});
+}
+ipcMain.handle('cmd:kill', (_e, id) => killCard(id));
 
 ipcMain.handle('cmd:stdin', (_e, { id, data, eof }) => {
   if (sessions && sessions.owns(id)) return sessions.stdin(id, data, eof);
@@ -316,12 +411,14 @@ ipcMain.on('cmd:ack', (_e, { id, bytes }) => relay.ack(id, bytes));
 ipcMain.handle('cmd:forget', (_e, id) => {
   if (sessions) sessions.forget(id);
   outputs.remove(id);
-  if (session) session.nodes.delete(id);
+  const c = canvases.get(cidOf(id));
+  if (c) c.nodes.delete(Number(String(id).split('.')[1]));
 });
 
 // The renderer starts or stops watching a running card. Starting returns what
 // its new terminal model needs to show the screen as it is.
-ipcMain.handle('out:subscribe', (_e, { id, on }) => {
+ipcMain.handle('out:subscribe', (e, { id, on }) => {
+  owners.set(cidOf(id), e.sender);
   if (!relay.subscribe(id, on)) return null;
   return on ? { replay: outputs.replay(id) } : {};
 });
@@ -349,9 +446,9 @@ ipcMain.handle('out:copy', async (_e, { id }) => {
   } finally { fs.rm(tmp, { force: true }, () => {}); }
 });
 
-ipcMain.handle('out:save', async (_e, { id, name }) => {
+ipcMain.handle('out:save', async (e, { id, name }) => {
   const base = String(name || 'output').replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'output';
-  const res = await dialog.showSaveDialog(win, { defaultPath: path.join(app.getPath('downloads'), `${base}.txt`) });
+  const res = await dialog.showSaveDialog(winOf(e.sender), { defaultPath: path.join(app.getPath('downloads'), `${base}.txt`) });
   if (res.canceled || !res.filePath) return null;
   const out = await outputs.exportPlain(id, res.filePath);
   return { path: res.filePath, ...out };
@@ -380,7 +477,7 @@ function snapshotPath(p) {
 }
 
 function cardInfo({ cardId, envFile }) {
-  return shellInfo.forCard({ cardId: Number.isFinite(cardId) ? cardId : null, envFile: snapshotPath(envFile) });
+  return shellInfo.forCard({ cardId: validKey(cardId) ? cardId : null, envFile: snapshotPath(envFile) });
 }
 
 // Only command names cross to the renderer, never the environment's values.
@@ -437,12 +534,10 @@ function shellHistories() {
 
 // Offered once, on the first launch that finds a history file.
 ipcMain.handle('history:offer', () => {
-  const s = settings();
-  if (s.historyOffered) return null;
+  if (settings().historyOffered) return null;
   const found = shellHistories();
   if (!found.length) return null;
-  s.historyOffered = true;
-  writeJSON(file('settings.json'), s);
+  writeSettings({ ...settings(), historyOffered: true });
   return { sources: found.map((h) => ({ name: h.name, count: h.records.length })) };
 });
 
@@ -487,6 +582,12 @@ ipcMain.handle('fs:names', async (_e, cwd) => {
     const d = await fs.promises.readdir(cwd, { withFileTypes: true });
     return d.slice(0, 80).map((x) => (x.isDirectory() ? `${x.name}/` : x.name));
   } catch { return []; }
+});
+
+ipcMain.handle('fs:isDir', (_e, p) => typeof p === 'string' && isDir(expandHome(p)));
+ipcMain.handle('fs:pickFolder', async (e) => {
+  const res = await dialog.showOpenDialog(winOf(e.sender), { properties: ['openDirectory', 'createDirectory'] });
+  return res.canceled ? null : res.filePaths[0];
 });
 
 function git(cwd, args) {
@@ -534,7 +635,7 @@ ipcMain.handle('worker:port', (e) => {
 ipcMain.handle('ai:complete', async (_e, { system, prompt, maxTokens }) => {
   const key = getApiKey();
   if (!key) return { ok: false, error: 'NO_KEY' };
-  const model = settings().model || DEFAULT_MODEL;
+  const model = settings().model || Settings.DEFAULTS.model;
   try {
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -560,140 +661,705 @@ ipcMain.handle('ai:complete', async (_e, { system, prompt, maxTokens }) => {
   }
 });
 
-// ---------------------------------------------------------------- settings / session
-ipcMain.handle('settings:get', () => {
-  const s = settings();
-  return {
-    model: s.model || DEFAULT_MODEL,
-    hasKey: !!getApiKey(),
-    keyFromEnv: !!process.env.ANTHROPIC_API_KEY,
-    forceColor: !!s.forceColor,
-    realPager: !!s.realPager,
-    outputCapGB: Number(s.outputCapGB) || 1,
-    outputTotalGB: Number(s.outputTotalGB) || 5,
-    shell: pickShell(),
-  };
+// ---------------------------------------------------------------- settings IPC
+ipcMain.handle('settings:get', () => pageSettings());
+
+// A partial change from the Settings page. The API key is encrypted with the
+// OS keychain when it can be.
+ipcMain.handle('settings:set', (_e, patch = {}) => {
+  const prev = settings();
+  const next = { ...prev };
+  const errors = [];
+  for (const [k, v] of Object.entries(patch)) {
+    if (k === 'apiKey') continue;
+    if (!Settings.SCHEMA[k] || Settings.SCHEMA[k].hidden) { errors.push(`"${k}" isn't a setting`); continue; }
+    const err = Settings.check(k, v);
+    if (err) errors.push(`${k} ${err}`); else next[k] = v;
+  }
+  if (typeof patch.apiKey === 'string') {
+    if (!patch.apiKey) { next.apiKey = ''; next.keyEncrypted = false; }
+    else if (safeStorage.isEncryptionAvailable()) {
+      next.apiKey = safeStorage.encryptString(patch.apiKey).toString('base64');
+      next.keyEncrypted = true;
+    } else { next.apiKey = patch.apiKey; next.keyEncrypted = false; }
+  }
+  writeSettings(next);
+  applySettings(prev);
+  return { ok: !errors.length, errors };
 });
 
-ipcMain.handle('settings:set', (_e, patch) => {
-  const s = settings();
-  if (typeof patch.model === 'string' && patch.model.trim()) s.model = patch.model.trim();
-  if (typeof patch.forceColor === 'boolean') s.forceColor = patch.forceColor;
-  const pagerChanged = typeof patch.realPager === 'boolean' && patch.realPager !== !!s.realPager;
-  if (pagerChanged) s.realPager = patch.realPager;
-  if (typeof patch.apiKey === 'string') {
-    if (!patch.apiKey) { delete s.apiKey; delete s.keyEncrypted; }
-    else if (safeStorage.isEncryptionAvailable()) {
-      s.apiKey = safeStorage.encryptString(patch.apiKey).toString('base64');
-      s.keyEncrypted = true;
-    } else { s.apiKey = patch.apiKey; s.keyEncrypted = false; }
+// Opens settings.json in the default editor; Loom picks up the changes.
+ipcMain.handle('settings:edit', async () => {
+  if (!fs.existsSync(file('settings.json'))) writeJSON(file('settings.json'), Settings.toFile(settings()), true);
+  return shell.openPath(file('settings.json'));
+});
+
+// ---------------------------------------------------------------- themes
+let themeSet = { themes: new Map(), errors: [] };
+const themeDir = () => file('themes');
+function loadThemes() {
+  themeSet = Themes.loadAll(path.join(__dirname, 'themes'), themeDir());
+}
+function watchThemes() {
+  fs.mkdirSync(themeDir(), { recursive: true });
+  try {
+    fs.watch(themeDir(), debounce(() => { loadThemes(); broadcast('themes:changed', themeList()); }, 150));
+  } catch { /* no watching */ }
+}
+const themeList = () => ({
+  themes: [...themeSet.themes.values()].map((t) => ({ id: t.id, name: t.name, type: t.type, builtin: t.builtin, contrast: t.contrast })),
+  errors: themeSet.errors,
+  system: nativeTheme.shouldUseDarkColors ? 'dark' : 'light',
+});
+ipcMain.handle('themes:list', () => themeList());
+ipcMain.handle('themes:get', (_e, id) => themeSet.themes.get(id) || themeSet.themes.get('loom-dark'));
+// .itermcolors, Windows Terminal JSON or a Loom theme, into userData/themes.
+async function importThemes(files) {
+  const added = [];
+  for (const f of files) {
+    for (const raw of Themes.importFile(f)) {
+      const t = Themes.normalize(raw);
+      const out = { name: t.name, type: t.type, background: t.background, foreground: t.foreground, cursor: t.cursor, selection: t.selection, ansi: t.ansi, ...(raw.ui ? { ui: raw.ui } : {}) };
+      writeJSON(path.join(themeDir(), `${t.id}.json`), out, true);
+      added.push({ id: t.id, name: t.name, contrast: t.contrast });
+    }
   }
-  for (const k of ['outputCapGB', 'outputTotalGB']) {
-    const v = Number(patch[k]);
-    if (Number.isFinite(v) && v > 0) s[k] = Math.min(v, 1024);
+  loadThemes();
+  broadcast('themes:changed', themeList());
+  return added;
+}
+ipcMain.handle('themes:import', async (e, { files } = {}) => {
+  let list = files;
+  if (!list) {
+    const res = await dialog.showOpenDialog(winOf(e.sender), { properties: ['openFile', 'multiSelections'], filters: [{ name: 'Themes', extensions: ['itermcolors', 'json'] }] });
+    if (res.canceled) return null;
+    list = res.filePaths;
   }
-  writeJSON(file('settings.json'), s);
-  outputs.setCaps(capsFromSettings());
-  if (pagerChanged && sessions) sessions.dropIdle();
+  try { return { added: await importThemes(list) }; } catch (err) { return { error: err.message }; }
+});
+ipcMain.handle('themes:folder', () => { fs.mkdirSync(themeDir(), { recursive: true }); return shell.openPath(themeDir()); });
+
+// ---------------------------------------------------------------- keybindings
+// userData/keybindings.json: [{ key, command, when? }]; "-command" removes a default.
+const keysFile = () => file('keybindings.json');
+function readKeys() {
+  let text = '';
+  try { text = fs.readFileSync(keysFile(), 'utf8'); } catch { return { list: [], error: null }; }
+  try {
+    const list = JSON.parse(text.replace(/^\s*\/\/.*$/gm, '') || '[]');
+    return Array.isArray(list) ? { list, error: null } : { list: [], error: 'keybindings.json should be a list' };
+  } catch (err) { return { list: [], error: `keybindings.json isn't valid JSON: ${err.message}` }; }
+}
+let keysText = '';
+function watchKeys() {
+  try {
+    fs.watch(app.getPath('userData'), debounce(() => {
+      let t = '';
+      try { t = fs.readFileSync(keysFile(), 'utf8'); } catch { /* none */ }
+      if (t === keysText) return;
+      keysText = t;
+      broadcast('keys:changed', readKeys());
+    }, 150));
+  } catch { /* no watching */ }
+}
+ipcMain.handle('keys:get', () => readKeys());
+ipcMain.handle('keys:set', (_e, list) => {
+  const text = `${JSON.stringify(list, null, 2)}\n`;
+  fs.writeFileSync(keysFile(), text);
+  keysText = text;
+  broadcast('keys:changed', readKeys());
   return true;
 });
+ipcMain.handle('keys:edit', () => {
+  if (!fs.existsSync(keysFile())) fs.writeFileSync(keysFile(), '[]\n');
+  return shell.openPath(keysFile());
+});
 
-// Snapshots hold exported env vars, so don't keep any no card points at.
-function pruneSnapshots(saved) {
-  const keep = new Set(((saved && saved.nodes) || []).map((n) => n.envFile && path.basename(n.envFile)));
+// ---------------------------------------------------------------- tabs and canvases
+// Each canvas: { meta, nodes: Map id -> node }, written debounced, atomically,
+// and only when it changed.
+const persist = !SMOKE || !!process.env.LOOM_SMOKE_USERDATA;
+const canvases = new Map();
+
+function canvasJSON(c) { return JSON.stringify({ ...c.meta, v: 3, nodes: [...c.nodes.values()] }); }
+function writeCanvas(cid) {
+  const c = canvases.get(cid);
+  if (!c) return;
+  clearTimeout(c.timer);
+  c.timer = null;
+  const json = canvasJSON(c);
+  if (json === c.written) return;
+  try { tabs.saveCanvas(cid, json); c.written = json; } catch (err) { console.warn(`canvas ${cid} not saved: ${err.message}`); }
+}
+function canvas(cid) {
+  let c = canvases.get(cid);
+  if (!c) {
+    const saved = tabs.loadCanvas(cid);
+    const meta = saved ? { ...saved } : {};
+    delete meta.nodes;
+    c = { meta, nodes: new Map(((saved && saved.nodes) || []).map((n) => [n.id, n])), timer: null, written: saved ? '' : null };
+    canvases.set(cid, c);
+    if (saved) c.written = canvasJSON(c);
+  }
+  return c;
+}
+
+// A tab's files go when it falls off the closed list.
+function dropCanvas(cid) {
+  canvases.delete(cid);
+  tabs.removeCanvas(cid);
+  outputs.prune((key) => !key.startsWith(`${cid}.`));
+  try { for (const n of fs.readdirSync(envDir())) if (n.startsWith(`card-${cid}.`)) fs.rmSync(path.join(envDir(), n), { force: true }); } catch { /* none */ }
+}
+
+// Output files and env snapshots no kept card points at.
+function prune() {
+  const keep = new Set();
+  const envs = new Set();
+  for (const cid of tabs.allIds()) {
+    for (const n of canvas(cid).nodes.values()) {
+      keep.add(`${cid}.${n.id}`);
+      if (n.envFile) envs.add(path.basename(n.envFile));
+    }
+  }
+  outputs.prune((key) => keep.has(key));
   let names = [];
   try { names = fs.readdirSync(envDir()); } catch { /* none yet */ }
-  for (const name of names) if (!keep.has(name)) fs.rm(path.join(envDir(), name), { force: true }, () => {});
+  for (const name of names) if (!envs.has(name)) fs.rm(path.join(envDir(), name), { force: true }, () => {});
 }
 
-// session.json holds card metadata only; output lives in userData/outputs.
-// main keeps the session in memory, the renderer sends what changed, and the
-// file is written debounced, atomically, and only when its contents changed.
-const persistSession = !SMOKE || !!process.env.LOOM_SMOKE_USERDATA;
-let session = null; // { meta, nodes: Map id -> node }
-let sessionWritten = '';
-let sessionTimer = null;
-
-function sessionJSON() {
-  return JSON.stringify({ ...session.meta, v: 2, nodes: [...session.nodes.values()] });
-}
-function writeSession() {
-  clearTimeout(sessionTimer);
-  sessionTimer = null;
-  if (!persistSession || !session) return;
-  const json = sessionJSON();
-  if (json === sessionWritten) return;
-  try {
-    const p = file('session.json');
-    const tmp = `${p}.tmp`;
-    fs.writeFileSync(tmp, json);
-    fs.renameSync(tmp, p);
-    sessionWritten = json;
-  } catch (err) { console.warn(`session not saved: ${err.message}`); }
-}
-const writeSessionSoon = () => { if (!sessionTimer) sessionTimer = setTimeout(writeSession, 500); };
-
-// Sessions from before output files kept each card's output tail inline.
-function migrate(saved) {
-  let changed = false;
-  for (const n of saved.nodes || []) {
-    if (Array.isArray(n.segs)) {
-      const text = n.segs.map((x) => x[1]).join('');
-      if (text) {
-        const out = outputs.put(n.id, text);
-        if (n.h == null) n.h = 62 + Math.min(out.lines * 19 + 22, n.bodyH || 300);
-      }
-      delete n.segs;
-      changed = true;
-    }
-    if (n.rich) {
-      if (['files', 'gitlog', 'gitstatus'].includes(n.rich.kind)) outputs.putRich(n.id, n.rich);
-      n.richKind = n.rich.kind;
-      delete n.rich;
-      changed = true;
-    }
+function startTabs() {
+  // The session.json from before tabs becomes the first tab.
+  if (!fs.existsSync(file('tabs.json'))) {
+    const res = migrateLegacy({ dir: app.getPath('userData'), putOutput: (k, t) => outputs.put(k, t), putRich: (k, v) => outputs.putRich(k, v) });
+    if (res && res.history) for (const cmd of res.history) if (typeof cmd === 'string') history.add({ cmd, cwd: null, exitCode: null, startedAt: 0 });
   }
-  if (changed) {
-    try { fs.copyFileSync(file('session.json'), file('session.v1.json')); } catch { /* nothing to keep */ }
-  }
-  return changed;
+  tabs = createTabStore({ dir: app.getPath('userData'), onDrop: dropCanvas, persist });
+  prune();
 }
 
-ipcMain.handle('session:load', () => {
-  relay.reset();
-  if (!persistSession) { session = { meta: {}, nodes: new Map() }; return null; }
-  const saved = readJSON(file('session.json'), null);
-  pruneSnapshots(saved);
-  const changed = saved ? migrate(saved) : false;
-  const nodes = (saved && saved.nodes) || [];
-  outputs.prune(new Set(nodes.map((n) => n.id)));
-  const meta = saved ? { ...saved } : {};
-  delete meta.nodes;
-  session = { meta, nodes: new Map(nodes.map((n) => [n.id, n])) };
-  if (changed) writeSession(); else sessionWritten = saved ? sessionJSON() : '';
-  return saved ? { ...meta, v: 2, nodes } : null;
+ipcMain.handle('tabs:get', (e) => {
+  const kind = kindOf(e.sender);
+  const t = tabs.get(kind);
+  if (!t.order.length) {
+    const folder = settings().defaultFolder && isDir(expandHome(settings().defaultFolder)) ? expandHome(settings().defaultFolder) : null;
+    tabs.create(kind, { title: folder ? path.basename(folder) : 'Home', folder });
+    return { ...tabs.get(kind), restored: false };
+  }
+  // Not restoring tabs: one fresh tab, the old ones closed (and reopenable).
+  if (!settings().restoreTabs && !e.sender.loomLoaded) {
+    for (const cid of t.order) tabs.close(kind, cid);
+    tabs.create(kind, { title: 'Home' });
+    return { ...tabs.get(kind), restored: false };
+  }
+  return { ...t, restored: true };
 });
-// { meta, nodes: { id: node | null } }: only what changed.
-ipcMain.handle('session:patch', (_e, patch) => {
-  if (!session) session = { meta: {}, nodes: new Map() };
-  if (patch.meta) Object.assign(session.meta, patch.meta);
-  for (const [id, n] of Object.entries(patch.nodes || {})) {
-    if (n) session.nodes.set(Number(id), n); else session.nodes.delete(Number(id));
-  }
-  writeSessionSoon();
+ipcMain.handle('tabs:create', (e, meta) => tabs.create(kindOf(e.sender), meta || {}));
+ipcMain.handle('tabs:set', (e, data) => { tabs.set(kindOf(e.sender), data || {}); return true; });
+// Closing a tab ends its shells and running commands; its cards and output are
+// kept for "reopen closed tab".
+ipcMain.handle('tabs:close', (e, cid) => {
+  writeCanvas(cid);
+  if (sessions) sessions.forgetCanvas(cid);
+  for (const key of procs.keys()) if (key.startsWith(`${cid}.`)) killCard(key);
+  tabs.close(kindOf(e.sender), cid);
   return true;
 });
-// The whole session at once (the e2e run, and before quitting).
-ipcMain.handle('session:save', (_e, data) => {
+ipcMain.handle('tabs:reopen', (e) => tabs.reopen(kindOf(e.sender)));
+
+ipcMain.handle('canvas:load', (e, cid) => {
+  if (!tabs.tab(cid)) return null;
+  owners.set(cid, e.sender);
+  const c = canvas(cid);
+  return { ...c.meta, v: 3, nodes: [...c.nodes.values()] };
+});
+// { cid, meta, nodes: { id: node | null } }: only what changed.
+ipcMain.handle('canvas:patch', (_e, { cid, meta, nodes }) => {
+  if (!tabs.tab(cid)) return false;
+  const c = canvas(cid);
+  if (meta) Object.assign(c.meta, meta);
+  for (const [id, n] of Object.entries(nodes || {})) {
+    if (n) c.nodes.set(Number(id), n); else c.nodes.delete(Number(id));
+  }
+  if (persist && !c.timer) c.timer = setTimeout(() => writeCanvas(cid), 500);
+  return true;
+});
+// A whole canvas at once (the e2e run, and before quitting).
+ipcMain.handle('canvas:save', (_e, { cid, data }) => {
+  if (!tabs.tab(cid)) return false;
   const meta = { ...data };
   delete meta.nodes;
-  session = { meta, nodes: new Map((data.nodes || []).map((n) => [n.id, n])) };
-  writeSession();
+  canvases.set(cid, { meta, nodes: new Map((data.nodes || []).map((n) => [n.id, n])), timer: null, written: (canvases.get(cid) || {}).written || '' });
+  if (persist) writeCanvas(cid);
+  return true;
+});
+function flushCanvases() { for (const cid of canvases.keys()) writeCanvas(cid); if (tabs) tabs.flush(); }
+
+// ---------------------------------------------------------------- open requests
+// From the command line, a second launch, the Dock, a loom:// URL or Finder.
+const pendingOpens = [];
+function handleOpen(args) {
+  if (!app.isReady() || !mainWin) { pendingOpens.push(args); return; }
+  const target = args.dropdown ? showDropdown() : showMain();
+  if (!target) return;
+  if (!hasRequest(args) || (args.dropdown && !args.folder)) return;
+  const req = { folder: args.folder && isDir(args.folder) ? args.folder : null, missing: args.folder && !isDir(args.folder) ? args.folder : null, newTab: !!args.newTab, exec: args.exec };
+  if (target.loomReady) target.webContents.send('open:request', req);
+  else (target.loomQueue = target.loomQueue || []).push(req);
+}
+ipcMain.handle('renderer:ready', (e) => {
+  const w = winOf(e.sender);
+  if (!w) return null;
+  w.loomReady = true;
+  e.sender.loomLoaded = true;
+  const q = w.loomQueue || [];
+  w.loomQueue = [];
+  return q;
+});
+
+app.on('second-instance', (_e, argv, cwd, data) => {
+  const args = data && data.args ? data.args : parseArgs(userArgs(argv, { defaultApp: !!process.defaultApp }), { cwd });
+  if (SMOKE) console.log(`[loom] second instance: ${JSON.stringify(args)}`);
+  handleOpen(args);
+});
+// macOS: folders dropped on the Dock icon, and loom:// URLs.
+app.on('open-file', (e, p) => { e.preventDefault(); handleOpen(parseArgs([p], { cwd: os.homedir() })); });
+app.on('open-url', (e, url) => { e.preventDefault(); handleOpen(parseArgs([url], { cwd: os.homedir() })); });
+
+// ---------------------------------------------------------------- the main window
+// Size, position, maximized and full-screen state and display, restored on a
+// display that still exists (the primary one otherwise).
+const winState = () => readJSON(file('window.json'), null);
+function restoreBounds() {
+  const saved = winState();
+  const fallback = { width: 1480, height: 920 };
+  if (!saved || !saved.bounds) return { bounds: fallback, saved };
+  const displays = screen.getAllDisplays();
+  const d = displays.find((x) => x.id === saved.displayId)
+    || displays.find((x) => { const a = x.workArea; const b = saved.bounds; return b.x < a.x + a.width && b.x + b.width > a.x && b.y < a.y + a.height && b.y + b.height > a.y; });
+  if (!d) {
+    const wa = screen.getPrimaryDisplay().workArea;
+    const w = Math.min(saved.bounds.width, wa.width); const h = Math.min(saved.bounds.height, wa.height);
+    return { bounds: { x: wa.x + Math.round((wa.width - w) / 2), y: wa.y + Math.round((wa.height - h) / 2), width: w, height: h }, saved };
+  }
+  const wa = d.workArea;
+  const b = { ...saved.bounds };
+  b.width = Math.min(b.width, wa.width);
+  b.height = Math.min(b.height, wa.height);
+  b.x = Math.max(wa.x, Math.min(b.x, wa.x + wa.width - b.width));
+  b.y = Math.max(wa.y, Math.min(b.y, wa.y + wa.height - b.height));
+  return { bounds: b, saved };
+}
+function saveWinState() {
+  if (!mainWin || mainWin.isDestroyed() || !persist) return;
+  const prev = winState() || {};
+  const normal = mainWin.isMaximized() || mainWin.isFullScreen() ? prev.bounds || mainWin.getBounds() : mainWin.getBounds();
+  writeJSON(file('window.json'), {
+    bounds: normal, maximized: mainWin.isMaximized(), fullscreen: mainWin.isFullScreen(),
+    displayId: screen.getDisplayMatching(mainWin.getBounds()).id,
+  });
+}
+const saveWinStateSoon = debounce(saveWinState, 400);
+
+const webPreferences = () => ({
+  preload: path.join(__dirname, 'preload.js'),
+  contextIsolation: true,
+  nodeIntegration: false,
+  sandbox: true,
+  backgroundThrottling: !SMOKE,
+});
+function wireWindow(w) {
+  w.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//.test(url)) shell.openExternal(url);
+    return { action: 'deny' };
+  });
+  w.webContents.on('will-navigate', (e) => e.preventDefault());
+  if (SMOKE) w.webContents.on('console-message', (e, _l, msg) => smokeLog(`[renderer${w === dropWin ? ':dropdown' : ''}] ${e.message || msg}`));
+  // A reloaded page acknowledges nothing it was sent before.
+  w.webContents.on('did-start-loading', () => { w.loomReady = false; });
+}
+
+let quitting = false;
+function createMainWindow() {
+  const { bounds, saved } = restoreBounds();
+  mainWin = new BrowserWindow({
+    ...bounds,
+    minWidth: 820,
+    minHeight: 560,
+    title: 'Loom',
+    show: false,
+    backgroundColor: nativeTheme.shouldUseDarkColors ? '#0c0e11' : '#f3f2ee',
+    titleBarStyle: isMac ? 'hiddenInset' : 'default',
+    webPreferences: webPreferences(),
+  });
+  wireWindow(mainWin);
+  mainWin.loadFile(path.join(__dirname, 'renderer', 'index.html'), { query: { window: 'main' } });
+  mainWin.once('ready-to-show', () => {
+    if (saved && saved.maximized) mainWin.maximize();
+    if (saved && saved.fullscreen) mainWin.setFullScreen(true);
+    mainWin.show();
+  });
+  for (const ev of ['resize', 'move', 'maximize', 'unmaximize', 'enter-full-screen', 'leave-full-screen']) mainWin.on(ev, saveWinStateSoon);
+  // macOS keeps Loom (and its tabs' running commands) when the window closes.
+  mainWin.on('close', (e) => {
+    saveWinState();
+    if (isMac && !quitting && !SMOKE) { e.preventDefault(); mainWin.hide(); }
+  });
+  mainWin.on('closed', () => { mainWin = null; if (!isMac || SMOKE) app.quit(); });
+  mainWin.on('focus', () => mainWin.webContents.send('window:focus', true));
+  mainWin.on('blur', () => mainWin && !mainWin.isDestroyed() && mainWin.webContents.send('window:focus', false));
+}
+function showMain() {
+  if (!mainWin) createMainWindow();
+  if (mainWin.isMinimized()) mainWin.restore();
+  mainWin.show();
+  mainWin.focus();
+  return mainWin;
+}
+
+// ---------------------------------------------------------------- the dropdown window
+// A frameless window that slides down from the top of the display the mouse
+// is on, toggled by a global hotkey. Its tabs are its own.
+let dropPinned = false;
+let dropReturnFocus = false;
+let hotkeyStatus = { key: '', ok: false, error: null };
+
+function createDropdown() {
+  dropWin = new BrowserWindow({
+    show: false, frame: false, resizable: true, movable: false, minimizable: false, maximizable: false, fullscreenable: false,
+    skipTaskbar: true, alwaysOnTop: true, hasShadow: true, roundedCorners: false, title: 'Loom',
+    backgroundColor: nativeTheme.shouldUseDarkColors ? '#0c0e11' : '#f3f2ee',
+    ...(isMac ? { type: 'panel' } : {}),
+    webPreferences: webPreferences(),
+  });
+  wireWindow(dropWin);
+  dropWin.loadFile(path.join(__dirname, 'renderer', 'index.html'), { query: { window: 'dropdown' } });
+  if (isMac) dropWin.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  else dropWin.setVisibleOnAllWorkspaces(true);
+  dropWin.setAlwaysOnTop(true, isMac ? 'pop-up-menu' : 'screen-saver');
+  dropWin.on('blur', () => {
+    if (settings().dropdownHideOnBlur && !dropPinned && dropWin.isVisible() && !dropAnimating) hideDropdown();
+  });
+  // Resizing from the bottom edge sets the height for next time.
+  dropWin.on('resized', () => {
+    const wa = screen.getDisplayMatching(dropWin.getBounds()).workArea;
+    const ratio = Math.round((dropWin.getBounds().height / wa.height) * 100) / 100;
+    if (Math.abs(ratio - settings().dropdownHeight) > 0.01) {
+      const prev = settings();
+      writeSettings({ ...prev, dropdownHeight: Math.max(0.15, Math.min(1, ratio)) });
+      broadcast('settings:changed', pageSettings());
+    }
+  });
+  dropWin.on('closed', () => { dropWin = null; });
+}
+
+let dropAnimating = false;
+function slide(from, to, done) {
+  dropAnimating = true;
+  const steps = 8;
+  let i = 0;
+  const tick = () => {
+    if (!dropWin || dropWin.isDestroyed()) return;
+    i++;
+    const t = 1 - (1 - i / steps) ** 3;
+    dropWin.setBounds({ ...to, y: Math.round(from.y + (to.y - from.y) * t) });
+    if (i < steps) setTimeout(tick, 12); else { dropAnimating = false; done && done(); }
+  };
+  tick();
+}
+function showDropdown() {
+  if (!dropWin) createDropdown();
+  if (dropWin.isVisible()) { dropWin.focus(); return dropWin; }
+  dropReturnFocus = !BrowserWindow.getFocusedWindow();
+  const d = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+  const wa = d.workArea;
+  const height = Math.round(wa.height * settings().dropdownHeight);
+  const to = { x: wa.x, y: wa.y, width: wa.width, height };
+  dropWin.setBounds({ ...to, y: wa.y - height });
+  dropWin.show();
+  dropWin.focus();
+  slide({ y: wa.y - height }, to, () => dropWin.focus());
+  dropWin.webContents.send('dropdown:shown');
+  return dropWin;
+}
+function hideDropdown() {
+  if (!dropWin || !dropWin.isVisible()) return;
+  const b = dropWin.getBounds();
+  slide({ y: b.y }, { ...b, y: b.y - b.height }, () => {
+    if (!dropWin) return;
+    dropWin.hide();
+    // Back to whatever app was in front.
+    if (isMac && dropReturnFocus && !(mainWin && mainWin.isFocused())) app.hide();
+  });
+}
+const toggleDropdown = () => (dropWin && dropWin.isVisible() && dropWin.isFocused() ? hideDropdown() : showDropdown());
+ipcMain.handle('dropdown:hide', () => hideDropdown());
+ipcMain.handle('dropdown:toggle', () => { toggleDropdown(); return true; });
+ipcMain.handle('dropdown:pin', (_e, on) => { dropPinned = !!on; return dropPinned; });
+
+function registerHotkey() {
+  if (hotkeyStatus.key) { try { globalShortcut.unregister(hotkeyStatus.key); } catch { /* not ours */ } }
+  const key = SMOKE ? process.env.LOOM_SMOKE_HOTKEY || '' : settings().dropdownHotkey;
+  hotkeyStatus = { key, ok: false, error: null };
+  if (!key) { hotkeyStatus.error = SMOKE ? 'not registered in the e2e run' : 'no hotkey set'; broadcast('settings:changed', pageSettings()); return; }
+  if (process.platform === 'linux' && (process.env.XDG_SESSION_TYPE === 'wayland' || process.env.WAYLAND_DISPLAY)) {
+    hotkeyStatus.error = 'Wayland doesn\'t let apps register global shortcuts. Bind a key in your desktop\'s settings to run: loom --dropdown';
+  } else {
+    try {
+      hotkeyStatus.ok = globalShortcut.register(key, toggleDropdown);
+      if (!hotkeyStatus.ok) hotkeyStatus.error = `${key} is taken by another app (or the system). Pick another one.`;
+    } catch (err) { hotkeyStatus.error = `"${key}" isn't a shortcut Electron understands: ${err.message}`; }
+  }
+  broadcast('settings:changed', pageSettings());
+}
+
+// ---------------------------------------------------------------- notifications
+// A long command that finished while Loom wasn't in front. Clicking it brings
+// back its tab and card.
+const notified = [];
+let smokeFocus = null;
+const loomFocused = () => (smokeFocus != null ? smokeFocus : !!BrowserWindow.getFocusedWindow());
+ipcMain.handle('app:focused', () => loomFocused());
+ipcMain.handle('notify', (e, { title, body, cid, id }) => {
+  if (!settings().notifications || loomFocused()) return false;
+  const w = winOf(e.sender);
+  notified.push({ title, body, cid, id });
+  if (!Notification.isSupported()) return false;
+  const n = new Notification({ title, body, silent: false });
+  n.on('click', () => {
+    if (!w || w.isDestroyed()) return;
+    if (w === dropWin) showDropdown(); else showMain();
+    w.webContents.send('notify:click', { cid, id });
+  });
+  n.show();
   return true;
 });
 
-ipcMain.handle('sys:info', () => ({
+// ---------------------------------------------------------------- integrations
+const binDirs = () => (process.env.LOOM_BIN_DIRS ? process.env.LOOM_BIN_DIRS.split(path.delimiter) : SMOKE ? ['~/.local/bin'] : ['/usr/local/bin', '~/.local/bin']);
+// The installed app links `loom` to its own Resources/bin/loom, which finds
+// the app from where it is; an AppImage gets a script that runs the AppImage
+// file (its path stays put across updates). A checkout gets a script that
+// runs Electron on the project folder.
+function launcherSpec() {
+  if (app.isPackaged && process.env.APPIMAGE) return { script: Launcher.launcherScript({ app: process.env.APPIMAGE }) };
+  if (app.isPackaged) return { link: path.join(process.resourcesPath, 'bin', 'loom') };
+  return { script: Launcher.launcherScript({ app: process.execPath, appDir: app.getAppPath() }) };
+}
+function integrationStatus() {
+  const launcher = Launcher.installed({ dirs: binDirs() });
+  return {
+    platform: process.platform,
+    launcher,
+    onPath: launcher ? loginPath.split(':').includes(path.dirname(launcher)) : false,
+    quickAction: isMac && fs.existsSync(Launcher.workflowPath()),
+    linux: process.platform === 'linux' && fs.existsSync(path.join(os.homedir(), '.local', 'share', 'applications', 'loom.desktop')),
+  };
+}
+ipcMain.handle('integrations:status', () => integrationStatus());
+
+// The app's icon as a file, for Linux .desktop entries.
+function linuxIcon() {
+  const src = app.isPackaged ? path.join(process.resourcesPath, 'icons', 'loom.png') : path.join(__dirname, 'build', 'icons', '512x512.png');
+  const dest = path.join(os.homedir(), '.local', 'share', 'icons', 'hicolor', '512x512', 'apps', 'loom.png');
+  try { fs.mkdirSync(path.dirname(dest), { recursive: true }); fs.copyFileSync(src, dest); return 'loom'; } catch { return 'utilities-terminal'; }
+}
+
+// An AppImage isn't in the applications menu until something adds it. Loom
+// offers once (AppImageLauncher users already have it).
+ipcMain.handle('appimage:offer', () => {
+  if (!process.env.APPIMAGE || settings().appImageOffered) return null;
+  writeSettings({ ...settings(), appImageOffered: true });
+  if (fs.existsSync(path.join(os.homedir(), '.local', 'share', 'applications', 'loom.desktop'))) return null;
+  return { path: process.env.APPIMAGE };
+});
+ipcMain.handle('appimage:integrate', async () => {
+  try {
+    const launcher = Launcher.installed({ dirs: binDirs() }) || (await installIntegration('launcher')).file;
+    const files = Launcher.installLinux(launcher, { icon: linuxIcon() });
+    execFile('update-desktop-database', [path.join(os.homedir(), '.local', 'share', 'applications')], () => {});
+    return { ok: true, files };
+  } catch (err) { return { ok: false, error: err.message }; }
+});
+
+// ---------------------------------------------------------------- .env, about, debug info
+ipcMain.handle('env:open', async () => {
+  const f = dotenvFile();
+  if (!fs.existsSync(f)) { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, Env.DOTENV_TEMPLATE, { mode: 0o600 }); }
+  // .env has no app of its own: macOS's default text editor, else the system's choice.
+  if (isMac) { execFile('open', ['-t', f], () => {}); return ''; }
+  return shell.openPath(f);
+});
+
+let shellVersion = '';
+function debugInfo() {
+  const osName = isMac ? `macOS ${process.getSystemVersion()}` : isWin ? `Windows ${os.release()}` : `${os.type()} ${os.release()}`;
+  return [
+    `Loom ${app.getVersion()} (${app.isPackaged ? (process.env.APPIMAGE ? 'AppImage' : 'installed') : 'from source'})`,
+    `Electron ${process.versions.electron} · Chromium ${process.versions.chrome} · Node ${process.versions.node} · V8 ${process.versions.v8}`,
+    `OS: ${osName} (${process.arch})`,
+    `Shell: ${pickShell()}${shellVersion ? ` — ${shellVersion}` : ''}${sessions ? '' : ' (one process per card)'}`,
+  ].join('\n');
+}
+function readShellVersion() {
+  if (isWin) return;
+  execFile(pickShell(), ['--version'], { timeout: 3000 }, (_e, out) => { shellVersion = String(out || '').split('\n')[0].trim(); });
+}
+// A new GitHub issue with the versions filled in. Nothing is sent by itself.
+function issueUrl(title = '', extra = '') {
+  const body = `**What happened**\n\n\n**What you expected**\n\n\n**Steps to reproduce**\n1. \n\n${extra}**Environment**\n\`\`\`\n${debugInfo()}\n\`\`\`\n`;
+  return `${REPO_URL}/issues/new?title=${encodeURIComponent(title)}&body=${encodeURIComponent(body)}`;
+}
+function showAbout(w) {
+  const icon = (() => { try { return nativeImage.createFromPath(app.isPackaged ? path.join(process.resourcesPath, 'icons', 'loom.png') : path.join(__dirname, 'build', 'icons', '256x256.png')); } catch { return undefined; } })();
+  dialog.showMessageBox(w || null, {
+    type: 'info', icon, title: 'About Loom', message: `Loom ${app.getVersion()}`,
+    detail: `A spatial terminal: every command is a card.\n\nElectron ${process.versions.electron}\nChromium ${process.versions.chrome}\nNode ${process.versions.node}\n\n${REPO_URL}`,
+    buttons: ['OK', 'Open on GitHub', 'Copy Debug Info'], defaultId: 0, cancelId: 0,
+  }).then(({ response }) => {
+    if (response === 1) shell.openExternal(REPO_URL);
+    if (response === 2) clipboard.writeText(debugInfo());
+  });
+}
+// Automatic updates arrive with signed releases; until then, the release page.
+function checkForUpdates(w) {
+  dialog.showMessageBox(w || null, {
+    type: 'info', title: 'Check for Updates', message: `You have Loom ${app.getVersion()}.`,
+    detail: `Updates are available at ${REPO_URL}/releases`, buttons: ['OK', 'Open Releases'], defaultId: 1, cancelId: 0,
+  }).then(({ response }) => { if (response === 1) shell.openExternal(`${REPO_URL}/releases`); });
+}
+ipcMain.handle('app:debugInfo', () => debugInfo());
+ipcMain.handle('app:about', (e) => showAbout(winOf(e.sender)));
+ipcMain.handle('app:reportIssue', () => shell.openExternal(issueUrl()));
+async function installIntegration(what) {
+  if (what === 'launcher') {
+    const res = Launcher.install({ ...launcherSpec(), dirs: binDirs(), pathEnv: loginPath });
+    return { ...res, message: res.onPath ? `Installed ${res.file}. Run \`loom .\` in any folder.` : `Installed ${res.file}, but ${res.dir} isn't on your PATH. Add it in your shell's rc file: export PATH="${res.dir}:$PATH"` };
+  }
+  const launcher = Launcher.installed({ dirs: binDirs() }) || (await installIntegration('launcher')).file;
+  if (what === 'finder') {
+    if (!isMac) throw new Error('the Finder Quick Action is macOS only');
+    const dir = Launcher.installQuickAction(launcher);
+    execFile('/System/Library/CoreServices/pbs', ['-flush'], () => {});
+    return { file: dir, message: 'Added "Open in Loom" to Finder\'s Quick Actions and Services menus (right-click a folder).' };
+  }
+  if (what === 'linux') {
+    if (process.platform !== 'linux') throw new Error('these are for Linux file managers');
+    const files = Launcher.installLinux(launcher, { icon: linuxIcon() });
+    execFile('update-desktop-database', [path.join(os.homedir(), '.local', 'share', 'applications')], () => {});
+    return { files, message: 'Added "Open in Loom" for Files (Nautilus), Nemo and Dolphin, and Loom as a folder handler.' };
+  }
+  throw new Error(`nothing called ${what}`);
+}
+ipcMain.handle('integrations:install', async (_e, what) => {
+  try { return { ok: true, ...(await installIntegration(what)), status: integrationStatus() }; } catch (err) { return { ok: false, error: err.message, status: integrationStatus() }; }
+});
+ipcMain.handle('integrations:uninstall', (_e, what) => {
+  let removed = [];
+  if (what === 'launcher') removed = Launcher.uninstall({ dirs: binDirs() });
+  if (what === 'finder') removed = [Launcher.uninstallQuickAction()].filter(Boolean);
+  if (what === 'linux') removed = Launcher.uninstallLinux();
+  return { ok: true, removed, status: integrationStatus() };
+});
+
+// ---------------------------------------------------------------- application menu
+// Items run renderer commands, so a rebinding shows here too. The keys are
+// the renderer's to handle (registerAccelerator: false), which keeps them
+// away from programs in live terminals that own them.
+let menuKeys = {};
+ipcMain.handle('menu:keys', (_e, keys) => { menuKeys = keys || {}; buildMenu(); return true; });
+function buildMenu() {
+  const run = (id) => (_item, w) => {
+    const target = w && !w.isDestroyed() ? w : (BrowserWindow.getFocusedWindow() || showMain());
+    target.webContents.send('command:run', id);
+  };
+  const item = (id, label) => ({ label, click: run(id), ...(menuKeys[id] ? { accelerator: menuKeys[id], registerAccelerator: false } : {}) });
+  const editRole = (role) => (isMac ? { role } : { role, registerAccelerator: false });
+  const template = [
+    ...(isMac ? [{
+      label: app.name,
+      submenu: [
+        { label: 'About Loom', click: (_i, w) => showAbout(w) },
+        { label: 'Check for Updates…', click: (_i, w) => checkForUpdates(w) },
+        { type: 'separator' },
+        item('settings.open', 'Settings…'),
+        item('loom.installCommand', "Install 'loom' command in PATH"),
+        item('loom.uninstallCommand', "Uninstall 'loom' command"),
+        { type: 'separator' }, { role: 'services' }, { type: 'separator' },
+        { role: 'hide' }, { role: 'hideOthers' }, { role: 'unhide' }, { type: 'separator' }, { role: 'quit' },
+      ],
+    }] : []),
+    {
+      label: 'File',
+      submenu: [
+        item('tab.new', 'New Tab'), item('tab.openFolder', 'Open Folder in New Tab…'), item('tab.reopen', 'Reopen Closed Tab'),
+        item('canvas.newRoot', 'New Root'), { type: 'separator' }, item('tab.close', 'Close Tab'),
+        ...(isMac ? [] : [{ type: 'separator' }, item('settings.open', 'Settings…'), item('loom.installCommand', "Install 'loom' command in PATH"), { label: 'Check for Updates…', click: (_i, w) => checkForUpdates(w) }, { role: 'quit' }]),
+      ],
+    },
+    { label: 'Edit', submenu: ['undo', 'redo', 'cut', 'copy', 'paste', 'selectAll'].map(editRole) },
+    {
+      label: 'View',
+      submenu: [
+        item('palette.open', 'Command Palette…'), item('view.map', 'History Map'), { type: 'separator' },
+        item('view.fit', 'Fit Everything'), item('view.zoomIn', 'Zoom In'), item('view.zoomOut', 'Zoom Out'), { type: 'separator' },
+        item('font.bigger', 'Bigger Text'), item('font.smaller', 'Smaller Text'), item('font.reset', 'Default Text Size'), { type: 'separator' },
+        item('dropdown.toggle', 'Dropdown Terminal'), { role: 'toggleDevTools' },
+      ],
+    },
+    {
+      label: 'Window',
+      submenu: [item('tab.next', 'Next Tab'), item('tab.prev', 'Previous Tab'), { type: 'separator' }, { role: 'minimize' }, { role: 'zoom' }, ...(isMac ? [{ type: 'separator' }, { role: 'front' }] : [])],
+    },
+    {
+      role: 'help',
+      submenu: [
+        item('palette.open', 'All Commands…'),
+        { type: 'separator' },
+        { label: 'Report an Issue…', click: () => shell.openExternal(issueUrl()) },
+        { label: 'Copy Debug Info', click: () => clipboard.writeText(debugInfo()) },
+        { label: 'Loom on GitHub', click: () => shell.openExternal(REPO_URL) },
+        ...(isMac ? [] : [{ type: 'separator' }, { label: 'About Loom', click: (_i, w) => showAbout(w) }]),
+      ],
+    },
+  ];
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
+// ---------------------------------------------------------------- quitting
+// Asks first when commands are still running, in any tab.
+function quitPrompt() {
+  const list = [...runningCards.values()];
+  if (!list.length || !settings().confirmQuit) return null;
+  return {
+    message: `${list.length} command${list.length === 1 ? ' is' : 's are'} still running`,
+    detail: `Quitting stops ${list.length === 1 ? 'it' : 'them'}:\n${list.slice(0, 12).map((c) => `  ${c.command.split('\n')[0].slice(0, 80)}`).join('\n')}${list.length > 12 ? `\n  …and ${list.length - 12} more` : ''}`,
+  };
+}
+app.on('before-quit', (e) => {
+  if (!quitting && !SMOKE) {
+    const p = quitPrompt();
+    if (p) {
+      const choice = dialog.showMessageBoxSync(mainWin && mainWin.isVisible() ? mainWin : null, { type: 'warning', buttons: ['Quit', 'Cancel'], defaultId: 1, cancelId: 1, message: p.message, detail: p.detail });
+      if (choice !== 0) { e.preventDefault(); return; }
+    }
+  }
+  quitting = true;
+  flushCanvases();
+  saveWinState();
+  if (outputs) outputs.shutdown();
+  if (sessions) sessions.shutdown();
+  for (const p of procs.values()) {
+    try { isWin ? p.child.kill() : process.kill(-p.child.pid, 'SIGTERM'); } catch { /* gone */ }
+  }
+});
+app.on('will-quit', () => globalShortcut.unregisterAll());
+app.on('window-all-closed', () => { if (!isMac || SMOKE) app.quit(); });
+
+// ---------------------------------------------------------------- sys
+ipcMain.handle('sys:info', (e) => ({
   platform: process.platform,
+  window: kindOf(e.sender),
   home: SMOKE && process.env.LOOM_SMOKE_CWD ? process.env.LOOM_SMOKE_CWD : os.homedir(),
   realHome: os.homedir(),
   user: os.userInfo().username,
@@ -703,27 +1369,35 @@ ipcMain.handle('sys:info', () => ({
   procStart: PROC_START,
   smokeResume: !!process.env.LOOM_SMOKE_RESUME,
   smokeMigrate: !!process.env.LOOM_SMOKE_MIGRATE,
+  smokeLauncher: !!process.env.LOOM_SMOKE_LAUNCHER,
+  smokePackaged: !!process.env.LOOM_SMOKE_PACKAGED,
+  packaged: app.isPackaged,
+  appImage: !!process.env.APPIMAGE,
   e2e: SMOKE ? { sudoPass: process.env.E2E_SUDO_PASS || '', ssh: !!process.env.E2E_SSH } : null,
   sessions: !!sessions,
 }));
 
+// ---------------------------------------------------------------- e2e and bench
+const smokeWin = (e) => winOf(e.sender);
 // Real keyboard input for the e2e run. Each key is a character or a keyCode,
 // optionally with modifiers, so it goes through the page's focus and key handlers.
-ipcMain.handle('smoke:keys', async (_e, keys) => {
-  if (!SMOKE || !win) return;
-  win.webContents.focus();
+ipcMain.handle('smoke:keys', async (e, keys) => {
+  const w = smokeWin(e);
+  if (!SMOKE || !w) return;
+  w.webContents.focus();
   for (const k of keys) {
     const { key, modifiers = /^[A-Z]$/.test(k) ? ['shift'] : [] } = typeof k === 'string' ? { key: k } : k;
-    win.webContents.sendInputEvent({ type: 'keyDown', keyCode: key, modifiers });
+    w.webContents.sendInputEvent({ type: 'keyDown', keyCode: key, modifiers });
     if (key.length === 1 && !modifiers.includes('control') && !modifiers.includes('meta')) {
-      win.webContents.sendInputEvent({ type: 'char', keyCode: key, modifiers });
+      w.webContents.sendInputEvent({ type: 'char', keyCode: key, modifiers });
     }
-    win.webContents.sendInputEvent({ type: 'keyUp', keyCode: key, modifiers });
+    w.webContents.sendInputEvent({ type: 'keyUp', keyCode: key, modifiers });
     await new Promise((r) => setTimeout(r, 15));
   }
 });
+ipcMain.handle('smoke:mouse', (e, ev) => { if (SMOKE) smokeWin(e).webContents.sendInputEvent(ev); });
 
-ipcMain.handle('smoke:copy', () => { if (SMOKE && win) win.webContents.copy(); });
+ipcMain.handle('smoke:copy', (e) => { if (SMOKE) smokeWin(e).webContents.copy(); });
 ipcMain.handle('smoke:clipboard', (_e, { write } = {}) => {
   if (!SMOKE) return null;
   if (typeof write === 'string') { clipboard.writeText(write); return write; }
@@ -741,13 +1415,28 @@ ipcMain.handle('smoke:out', async (_e, { id, raw }) => {
   } catch { return ''; }
 });
 
-ipcMain.handle('smoke:resize', (_e, { width, height }) => { if (SMOKE && win) win.setSize(width, height); });
+ipcMain.handle('smoke:resize', (e, { width, height }) => { if (SMOKE) smokeWin(e).setSize(width, height); });
 
 // A real paste, through the clipboard and the page's paste event.
-ipcMain.handle('smoke:paste', (_e, text) => {
-  if (!SMOKE || !win) return;
+ipcMain.handle('smoke:paste', (e, text) => {
+  if (!SMOKE) return;
   clipboard.writeText(text);
-  win.webContents.paste();
+  smokeWin(e).webContents.paste();
+});
+ipcMain.handle('smoke:theme', (_e, source) => { if (SMOKE) nativeTheme.themeSource = source; });
+ipcMain.handle('smoke:focus', (_e, focused) => { if (SMOKE) smokeFocus = focused; });
+ipcMain.handle('smoke:state', () => SMOKE && {
+  notified, quit: quitPrompt(), hotkey: hotkeyStatus,
+  dropdown: dropWin ? { visible: dropWin.isVisible(), animating: dropAnimating, bounds: dropWin.getBounds(), workArea: screen.getDisplayMatching(dropWin.getBounds()).workArea } : null,
+  windows: windows().length,
+});
+ipcMain.handle('smoke:hotkey', () => { if (SMOKE) toggleDropdown(); });
+// Writes settings.json as an editor would, for the validation check.
+ipcMain.handle('smoke:writeSettings', (_e, text) => { if (SMOKE) fs.writeFileSync(file('settings.json'), text); });
+ipcMain.handle('smoke:quit', () => { if (SMOKE) { quitting = true; app.quit(); } });
+ipcMain.handle('smoke:dropdownRun', async (_e, cmd) => {
+  if (!SMOKE || !dropWin) return null;
+  return dropWin.webContents.executeJavaScript(`window.__loomSmoke && window.__loomSmoke(${JSON.stringify(cmd)})`);
 });
 
 // ---------------------------------------------------------------- bench
@@ -775,70 +1464,66 @@ ipcMain.handle('bench:mem', (_e, { reset } = {}) => {
 // scripts/bench.js reads these lines.
 ipcMain.handle('bench:report', (_e, result) => { if (BENCH) console.log(`[bench] ${JSON.stringify(result)}`); });
 
-// test/e2e.js reads these lines.
+// test/e2e.js reads these lines, from stdout or, for an app started with
+// `open`, from LOOM_SMOKE_REPORT.
+const smokeLog = (line) => {
+  console.log(line);
+  if (process.env.LOOM_SMOKE_REPORT) fs.appendFileSync(process.env.LOOM_SMOKE_REPORT, `${line}\n`);
+};
 ipcMain.handle('smoke:report', (_e, results) => {
   if (!SMOKE) return;
-  for (const r of results) console.log(`[e2e] ${r.ok ? 'PASS' : 'FAIL'} ${r.name}${r.ok ? '' : ` :: ${r.detail}`}`);
-  console.log(`[e2e] END ${results.length}`);
+  for (const r of results) smokeLog(`[e2e] ${r.ok ? 'PASS' : 'FAIL'} ${r.name}${r.ok ? '' : ` :: ${r.detail}`}`);
+  smokeLog(`[e2e] END ${results.length}`);
+});
+ipcMain.handle('smoke:log', (_e, line) => { if (SMOKE) smokeLog(String(line)); });
+ipcMain.handle('smoke:packaged', () => SMOKE && {
+  packaged: app.isPackaged, loginPath, dotenv: dotenvFile(), resources: process.resourcesPath, exe: process.execPath, debug: debugInfo(),
 });
 
-ipcMain.handle('smoke:done', async (_e, opts = {}) => {
-  if (!SMOKE || !win) return;
-  const img = await win.webContents.capturePage();
+ipcMain.handle('smoke:done', async (e, opts = {}) => {
+  const w = smokeWin(e);
+  if (!SMOKE || !w) return;
+  const img = await w.webContents.capturePage();
   fs.writeFileSync(opts.suffix ? SMOKE.replace(/\.png$/, `-${opts.suffix}.png`) : SMOKE, img.toPNG());
-  if (!opts.keep) app.quit();
+  if (!opts.keep) { quitting = true; app.quit(); }
 });
 
-// ---------------------------------------------------------------- window
-function createWindow() {
-  win = new BrowserWindow({
-    width: 1480,
-    height: 920,
-    minWidth: 820,
-    minHeight: 560,
-    title: 'Loom',
-    backgroundColor: '#0c0e11',
-    titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true,
-      backgroundThrottling: !SMOKE,
-    },
-  });
-  win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
-  win.webContents.setWindowOpenHandler(({ url }) => {
-    if (/^https?:\/\//.test(url)) shell.openExternal(url);
-    return { action: 'deny' };
-  });
-  win.webContents.on('will-navigate', (e) => e.preventDefault());
-  if (SMOKE) {
-    win.webContents.on('console-message', (e, _l, msg) => console.log(`[renderer] ${e.message || msg}`));
-    if (process.env.LOOM_THEME) nativeTheme.themeSource = process.env.LOOM_THEME;
-  }
-  win.on('closed', () => { win = null; });
+// ---------------------------------------------------------------- start
+if (!SMOKE && primary) {
+  if (process.defaultApp) app.setAsDefaultProtocolClient('loom', process.execPath, [path.resolve(process.argv[1] || '.')]);
+  else app.setAsDefaultProtocolClient('loom');
 }
 
 app.whenReady().then(async () => {
+  if (!primary) return;
+  readSettings();
+  watchSettings();
   history = createHistory(file('history.jsonl'));
   startOutputs();
+  startTabs();
+  loadThemes();
+  watchThemes();
+  keysText = (() => { try { return fs.readFileSync(keysFile(), 'utf8'); } catch { return ''; } })();
+  watchKeys();
+  // Local font access, for the font picker.
+  const allowed = ['local-fonts', 'notifications', 'clipboard-sanitized-write'];
+  electronSession.defaultSession.setPermissionCheckHandler((_wc, perm) => allowed.includes(perm));
+  electronSession.defaultSession.setPermissionRequestHandler((_wc, perm, cb) => cb(allowed.includes(perm)));
+  nativeTheme.on('updated', () => broadcast('themes:changed', themeList()));
+  if (SMOKE && process.env.LOOM_THEME) nativeTheme.themeSource = process.env.LOOM_THEME;
   await resolveLoginPath();
+  readShellVersion();
   startSessions();
   shellInfo = createShellInfo({ shell: pickShell(), env: () => cmdEnv({ plain: true }), sessions });
   if (!isWin) shellInfo.probeBase();
-  createWindow();
+  buildMenu();
+  createMainWindow();
+  registerHotkey();
+  // The dropdown loads in the background, so the hotkey shows it at once.
+  if (!BENCH) setTimeout(() => { if (!dropWin) createDropdown(); }, SMOKE ? 0 : 1500);
+  if (hasRequest(launchArgs)) handleOpen(launchArgs);
+  for (const a of pendingOpens.splice(0)) handleOpen(a);
   // Warm the specs people reach for first.
   setTimeout(() => { for (const n of ['git', 'npm', 'docker']) completer.loadSpec(n); }, 3000);
-  app.on('activate', () => { if (!BrowserWindow.getAllWindows().length) createWindow(); });
+  app.on('activate', () => showMain());
 });
-
-app.on('before-quit', () => {
-  writeSession();
-  if (outputs) outputs.shutdown();
-  if (sessions) sessions.shutdown();
-  for (const p of procs.values()) {
-    try { isWin ? p.child.kill() : process.kill(-p.child.pid, 'SIGTERM'); } catch { /* gone */ }
-  }
-});
-app.on('window-all-closed', () => { if (process.platform !== 'darwin' || SMOKE) app.quit(); });

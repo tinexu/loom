@@ -16,7 +16,10 @@
     '#4a515c', '#b8323b', '#1f6b37', '#7a5600', '#2353b0', '#7a35a3', '#106a6f', '#3f4650',
   ];
   const lightTheme = g && g.matchMedia ? g.matchMedia('(prefers-color-scheme: light)') : { matches: false, addEventListener() {} };
-  const palette = () => (lightTheme.matches ? LIGHT : DARK);
+  // The active theme's 16 colors; the built-in pair until a theme is applied.
+  let custom = null;
+  const palette = () => custom || (lightTheme.matches ? LIGHT : DARK);
+  const setPalette = (colors) => { custom = Array.isArray(colors) && colors.length === 16 ? colors.slice() : null; };
   const RE = /\x1b\[([0-9;?]*)([ -\/]*[@-~])|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|\x1b[=>78DEHMc]/g;
 
   function c256(n) {
@@ -109,5 +112,5 @@
     return out;
   }
 
-  return { toHtml, strip, escapeHtml, normalize, palette, lightTheme, applySGR, styleOf, RE };
+  return { toHtml, strip, escapeHtml, normalize, palette, setPalette, lightTheme, applySGR, styleOf, RE };
 }));

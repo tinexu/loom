@@ -58,7 +58,7 @@ const INFO = [
   ['map.mapScroll', '20,000 cards: history map scroll, per frame', 'ms'],
   ['startup.peakMainMB', 'startup: peak main', 'MB'],
   ['startup.peakRendererMB', 'startup: peak renderer', 'MB'],
-  ['startup.sessionMB', 'session.json size', 'MB'],
+  ['startup.sessionMB', 'saved session size', 'MB'],
 ];
 
 function homeFixture(root) {
@@ -121,7 +121,11 @@ const fmt = (v) => (v == null ? '—' : typeof v === 'number' ? (Math.abs(v) >= 
     results.first = await launch(fx, ud, { LOOM_BENCH: 'first' });
     console.log('startup: second launch, pan and zoom…');
     results.startup = await launch(fx, ud, { LOOM_BENCH: 'startup' });
-    results.startup.sessionMB = fs.statSync(path.join(ud, 'session.json')).size / 1048576;
+    // Saved canvases (one per tab since tabs; session.json before).
+    const canvasDir = path.join(ud, 'canvases');
+    results.startup.sessionMB = fs.existsSync(canvasDir)
+      ? fs.readdirSync(canvasDir).reduce((a, f) => a + fs.statSync(path.join(canvasDir, f)).size, 0) / 1048576
+      : fs.statSync(path.join(ud, 'session.json')).size / 1048576;
   }
   if (!ONLY || ONLY === 'map') {
     const ud = path.join(root, 'ud-map');

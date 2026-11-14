@@ -13,26 +13,14 @@
   const MAX_LIVE = 8; // browsers cap WebGL contexts at about 16 per page
   const MIN_ZOOM = 0.6;
   const SCROLLBACK = 10000;
-  const FONT = 12;
-  const OVERLAY_FONT = 13;
+  const FONT = 12; // when there are no font settings yet
   const ESC_ESC_MS = 400;
   const SNAPSHOT_MS = 200;
   const SNAPSHOT_LINES = 400;
   const isMac = navigator.platform.startsWith('Mac');
 
-  function theme() {
-    const css = getComputedStyle(document.documentElement);
-    const token = (name) => css.getPropertyValue(name).trim();
-    const p = Ansi.palette();
-    return {
-      background: token('--card'), foreground: token('--text'),
-      cursor: token('--accent'), cursorAccent: token('--accent-ink'),
-      selectionBackground: Ansi.lightTheme.matches ? 'rgba(31, 157, 85, 0.25)' : 'rgba(126, 224, 161, 0.3)',
-      black: p[0], red: p[1], green: p[2], yellow: p[3], blue: p[4], magenta: p[5], cyan: p[6], white: p[7],
-      brightBlack: p[8], brightRed: p[9], brightGreen: p[10], brightYellow: p[11],
-      brightBlue: p[12], brightMagenta: p[13], brightCyan: p[14], brightWhite: p[15],
-    };
-  }
+  // The active theme's terminal colors (renderer/theme.js), on the card's background.
+  const theme = () => g.Theme.xterm() || {};
   const monoFont = () => getComputedStyle(document.documentElement).getPropertyValue('--mono').trim();
 
   // ---------------------------------------------------------------- buffer → text
@@ -89,16 +77,26 @@
   // onAlt(n, entered), onRelease(n, focused) when keyboard control leaves a terminal.
   function create(opts) {
     const { api, layer, overlay, slot } = opts;
-    const terms = new Map(); // card id -> t
+    const terms = new Map(); // card key -> t
+    const fontSize = () => (opts.font && opts.font()) || FONT;
+    // Cursor and scrollback from settings, and the font weight.
+    const termOptions = () => {
+      const s = (opts.settings && opts.settings()) || {};
+      const f = g.Theme.fonts() || {};
+      return {
+        cursorBlink: s.cursorBlink !== false, cursorStyle: s.cursorStyle || 'block', scrollback: s.scrollback || SCROLLBACK,
+        fontWeight: f.weight || 400, fontWeightBold: Math.min(900, (f.weight || 400) + 300),
+      };
+    };
     const attached = new Set();
     let overlaid = null;
     let peak = 0;
 
     const newTerm = () => {
       const term = new g.Terminal({
-        cols: 120, rows: 40, scrollback: SCROLLBACK, allowProposedApi: true,
-        fontFamily: monoFont(), fontSize: FONT, lineHeight: 1.2, theme: theme(),
-        minimumContrastRatio: 3, macOptionIsMeta: true, cursorBlink: true,
+        cols: 120, rows: 40, allowProposedApi: true,
+        fontFamily: monoFont(), fontSize: fontSize(), lineHeight: 1.2, theme: theme(),
+        minimumContrastRatio: 3, macOptionIsMeta: true, ...termOptions(),
       });
       term.loadAddon(new g.Unicode11Addon.Unicode11Addon());
       term.unicode.activeVersion = '11';
@@ -109,17 +107,17 @@
     // everything (a card that just started); otherwise it asks main to start,
     // and shows main's replay of the screen first.
     function attach(n, { fresh = false } = {}) {
-      dispose(n.id);
+      dispose(n.key);
       const term = newTerm();
       const t = {
         n, term, fit: null, search: null, webgl: null, host: null, find: null, opened: false,
         visible: false, focused: false, focusedAt: 0, lastEsc: 0, lastSnapshot: 0, snapTimer: null, snap: '',
         resizeTimer: null, fitTimer: null, w: 0, h: 0, queue: fresh ? null : [],
       };
-      terms.set(n.id, t);
+      terms.set(n.key, t);
       if (!fresh) {
-        api.outSubscribe({ id: n.id, on: true }).then((res) => {
-          if (terms.get(n.id) !== t) return;
+        api.outSubscribe({ id: n.key, on: true }).then((res) => {
+          if (terms.get(n.key) !== t) return;
           const q = t.queue;
           t.queue = null;
           if (res && res.replay) t.term.write(res.replay);
@@ -128,11 +126,11 @@
         });
       }
       // Input and the terminal's own query replies go to the PTY and nowhere else.
-      term.onData((data) => api.stdin({ id: n.id, data }));
-      term.onBinary((data) => api.stdin({ id: n.id, data }));
+      term.onData((data) => api.stdin({ id: n.key, data }));
+      term.onBinary((data) => api.stdin({ id: n.key, data }));
       term.onResize(({ cols, rows }) => {
         clearTimeout(t.resizeTimer);
-        t.resizeTimer = setTimeout(() => api.resize({ id: n.id, cols, rows }), 60);
+        t.resizeTimer = setTimeout(() => api.resize({ id: n.key, cols, rows }), 60);
       });
       term.buffer.onBufferChange((buf) => opts.onAlt(n, buf.type === 'alternate'));
       term.attachCustomKeyEventHandler((e) => onKey(t, e));
@@ -141,7 +139,7 @@
 
     function feed(t, text) {
       t.term.write(text, () => {
-        api.ack({ id: t.n.id, bytes: text.length });
+        api.ack({ id: t.n.key, bytes: text.length });
         opts.onOutput(t.n);
       });
     }
@@ -160,23 +158,20 @@
     }
 
     // ------------------------------------------------------------ keyboard
-    function onKey(t, e) {
-      const down = e.type === 'keydown';
-      const key = e.key.toLowerCase();
-      const mod = e.metaKey || e.ctrlKey;
-      if (mod && e.shiftKey && key === 'e') { if (down) release(t); return false; }
-      if (mod && e.shiftKey && key === 'f') { if (down) openFind(t); return false; }
-      if (e.key === 'Escape' && down) {
-        const now = performance.now();
-        if (now - t.lastEsc < ESC_ESC_MS) { t.lastEsc = 0; release(t); return false; }
-        t.lastEsc = now;
-        return true; // the first Esc still belongs to the program
-      }
-      if (e.ctrlKey && e.shiftKey && key === 'c') {
-        if (down && t.term.hasSelection()) navigator.clipboard.writeText(t.term.getSelection());
-        return false;
-      }
-      return !(isMac && e.metaKey); // ⌘ shortcuts stay with Loom and the OS
+    // Loom's own keys in a terminal are commands (renderer/commands.js), which
+    // see the key first. Everything else is the program's, except ⌘ on macOS,
+    // which stays with Loom and the OS.
+    const onKey = (_t, e) => !(isMac && e.metaKey);
+    const focusedT = () => { for (const t of terms.values()) if (t.focused || (t.opened && document.activeElement === t.term.textarea)) return t; return null; };
+
+    // Esc Esc returns to the canvas; the first Esc still belongs to the program.
+    function escape() {
+      const t = focusedT();
+      if (!t) return false;
+      const now = performance.now();
+      if (now - t.lastEsc < ESC_ESC_MS) { t.lastEsc = 0; release(t); return true; }
+      t.lastEsc = now;
+      return false;
     }
 
     function release(t) {
@@ -261,7 +256,7 @@
       if (!t.opened) open(t);
       fitNow(t);
       // WebGL compiles its shaders on load; a task of its own keeps both short.
-      setTimeout(() => { if (attached.has(t) && terms.get(t.n.id) === t) { loadWebgl(t); t.term.refresh(0, t.term.rows - 1); } }, 0);
+      setTimeout(() => { if (attached.has(t) && terms.get(t.n.key) === t) { loadWebgl(t); t.term.refresh(0, t.term.rows - 1); } }, 0);
     }
 
     // The Terminal stays as the card's model. Only its view and WebGL context go.
@@ -298,7 +293,7 @@
         style.top = `${r.y}px`;
         style.width = `${r.w}px`;
         style.height = `${r.h}px`;
-        const font = Math.round(FONT * r.k * 2) / 2;
+        const font = Math.round(fontSize() * r.k * 2) / 2;
         if (t.term.options.fontSize !== font) t.term.options.fontSize = font;
         if (r.w !== t.w || r.h !== t.h) { t.w = r.w; t.h = r.h; fitSoon(t); }
       } else if (t.focused) release(t);
@@ -310,7 +305,7 @@
     }
 
     function show(n, { focus = false } = {}) {
-      const t = terms.get(n.id);
+      const t = terms.get(n.key);
       if (!t) return;
       promote(t);
       if (focus && t.visible) takeFocus(t);
@@ -319,7 +314,7 @@
 
     // ------------------------------------------------------------ overlay
     function expand(n) {
-      const t = terms.get(n.id);
+      const t = terms.get(n.key);
       if (!t) return;
       if (overlaid && overlaid !== t) collapse();
       promote(t);
@@ -328,7 +323,7 @@
       Object.assign(t.host.style, { left: '', top: '', width: '', height: '' });
       t.host.hidden = false;
       t.w = 0;
-      t.term.options.fontSize = OVERLAY_FONT;
+      t.term.options.fontSize = fontSize() + 1;
       overlay.hidden = false;
       setVisible(t, false); // the card shows its snapshot while the overlay has the terminal
       requestAnimationFrame(() => { overlay.classList.add('open'); fitNow(t); });
@@ -342,7 +337,7 @@
       overlaid = null;
       overlay.classList.remove('open');
       setTimeout(() => { if (!overlaid) overlay.hidden = true; }, 180);
-      if (terms.has(t.n.id)) {
+      if (terms.has(t.n.key)) {
         layer.append(t.host);
         position(t);
         fitNow(t);
@@ -360,7 +355,7 @@
     // Returns { live: true } while a live view covers the card body, or the
     // snapshot text (refreshed at most every SNAPSHOT_MS), or null with no model.
     function refresh(n, again) {
-      const t = terms.get(n.id);
+      const t = terms.get(n.key);
       if (!t) return null;
       if (t.visible) return { live: true };
       const wait = SNAPSHOT_MS - (performance.now() - t.lastSnapshot);
@@ -373,7 +368,7 @@
     // text is what the card keeps: from its model, or from a model fed main's
     // replay if it had none. Null means the output file is the text as it is.
     async function finish(n, { moved = false } = {}) {
-      const t = terms.get(n.id);
+      const t = terms.get(n.key);
       let focused = false;
       let text = null;
       if (t) {
@@ -383,9 +378,9 @@
         focused = !!t.opened && document.activeElement === t.term.textarea;
         if (overlaid === t) collapse();
         if (moved) text = bufferText(t.term.buffer.normal, 0);
-        dispose(n.id);
+        dispose(n.key);
       } else if (moved) {
-        const res = await api.outReplay({ id: n.id, full: true });
+        const res = await api.outReplay({ id: n.key, full: true });
         const term = newTerm();
         await new Promise((r) => term.write((res && res.replay) || '', r));
         text = bufferText(term.buffer.normal, 0);
@@ -408,22 +403,32 @@
       opts.onChange(t.n);
     }
 
-    Ansi.lightTheme.addEventListener('change', () => {
-      for (const t of terms.values()) t.term.options.theme = theme();
-    });
+    // A new theme, font or terminal setting reaches every model and live view.
+    function setOptions() {
+      const o = { theme: theme(), fontFamily: monoFont(), ...termOptions() };
+      for (const t of terms.values()) {
+        Object.assign(t.term.options, o);
+        if (overlaid !== t) t.w = 0;
+      }
+      layout();
+      if (overlaid) { overlaid.term.options.fontSize = fontSize() + 1; fitNow(overlaid); }
+    }
     window.addEventListener('resize', () => {
       layout();
       if (overlaid) fitNow(overlaid);
     });
 
     return {
-      attach, write, release: releaseModel, show, layout, expand, collapse, refresh, finish, dispose,
+      attach, write, release: releaseModel, escape, setOptions, show,
+      releaseFocused: () => { const t = focusedT(); if (t) release(t); return !!t; },
+      findFocused: () => { const t = focusedT(); if (t && t.find) openFind(t); return !!t; },
+      copyFocused: () => { const t = focusedT(); if (t && t.term.hasSelection()) navigator.clipboard.writeText(t.term.getSelection()); return !!t; }, layout, expand, collapse, refresh, finish, dispose,
       has: (id) => terms.has(id),
       isLive: (id) => { const t = terms.get(id); return !!t && t.visible; },
       isFocused: (id) => { const t = terms.get(id); return !!t && t.focused; },
       inAlt: (id) => { const t = terms.get(id); return !!t && t.term.buffer.active.type === 'alternate'; },
       // For the e2e run.
-      stats: () => ({ live: attached.size, peak, models: terms.size, overlay: overlaid ? overlaid.n.id : null }),
+      stats: () => ({ live: attached.size, peak, models: terms.size, overlay: overlaid ? overlaid.n.key : null }),
       term: (id) => { const t = terms.get(id); return t ? t.term : null; },
     };
   }

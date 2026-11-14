@@ -441,5 +441,5 @@
     };
   }
 
-  g.VLines = { create, forget };
+  g.VLines = { create, forget, forgetAll: () => cache.clear() };
 })(window);

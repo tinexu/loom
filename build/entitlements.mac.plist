@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- V8's JIT. Electron needs both under the hardened runtime. -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+  <!-- Programs run in Loom's terminals are its child processes, so macOS asks
+       on Loom's behalf when one of them (osascript, open -a, a build script)
+       sends Apple Events. Without this the hardened runtime denies them
+       silently. -->
+  <key>com.apple.security.automation.apple-events</key>
+  <true/>
+</dict>
+</plist>
