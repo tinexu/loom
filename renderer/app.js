@@ -1980,7 +1980,11 @@ Respond with only a JSON object (no prose, no code fences):
     if (cv === cur) {
       const next = order[i + 1] || order[i - 1];
       if (next) await switchTo(next);
-      else await newTab({ cwd: cv.rootCwd });
+      // The last tab: start over in the default folder, not wherever this one was.
+      else {
+        const d = settingsNow.defaultFolder;
+        await newTab({ cwd: d ? (d === '~' || d.startsWith('~/') ? sys.home + d.slice(1) : d) : sys.home });
+      }
     }
     order = order.filter((x) => x !== cid);
     canvases.delete(cid);
@@ -2553,7 +2557,7 @@ Respond with only a JSON object (no prose, no code fences):
 
     check('uses PTY sessions', sys.sessions, sys);
     // ---- first launch: one opt-in toast to import shell history
-    const until0 = async (fn, ms = 8000) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (fn()) return true; await wait(40); } return !!fn(); };
+    const until0 = async (fn, ms = 8000) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (await fn()) return true; await wait(40); } return !!(await fn()); };
     const offer = () => [...document.querySelectorAll('.toast')].find((t) => /zsh_history/.test(t.textContent));
     check('import: first launch offers it in a toast', await until0(offer), [...document.querySelectorAll('.toast')].map((t) => t.textContent));
     check('import: nothing imported before you ask', !state.history.some((r) => r.cmd === 'git checkout feature'), null);
@@ -2733,7 +2737,7 @@ Respond with only a JSON object (no prose, no code fences):
   async function smokeTerminals({ run, text, check, wait, done }) {
     const { rawOf } = smokeOut;
     window.loomE2E = sys.e2e;
-    const until = async (fn, ms = 8000) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (fn()) return true; await wait(40); } return !!fn(); };
+    const until = async (fn, ms = 8000) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (await fn()) return true; await wait(40); } return !!(await fn()); };
     const keys = (s) => api.smokeKeys([...s]);
     const ENTER = { key: 'Return' };
     const ESC = { key: 'Escape' };
@@ -2769,6 +2773,20 @@ Respond with only a JSON object (no prose, no code fences):
     check('vim: card keeps only the normal screen', !/edited-in-vim|~/.test(text(vim)), text(vim).slice(0, 200));
     const edited = await run('head -1 README.md', vim);
     check('vim: edit saved, shell still usable', text(edited) === 'edited-in-vim', text(edited));
+
+    // ---- vim typed into the command bar, then typed into
+    els.prompt.focus();
+    await api.smokeKeys([...'vim typed.txt', ENTER]);
+    await until(() => [...state.nodes.values()].some((x) => x.cmd === 'vim typed.txt'));
+    const vimBar = [...state.nodes.values()].find((x) => x.cmd === 'vim typed.txt');
+    await until(() => terminals.stats().overlay === (vimBar && vimBar.key));
+    await wait(300);
+    const focusedAt = document.activeElement && (document.activeElement.id || document.activeElement.className);
+    await api.smokeKeys(['i', ...'typed-into-vim', ESC, ':', 'w', 'q', ENTER]);
+    await done(vimBar);
+    check('vim from the command bar: keys go to vim, not the bar', vimBar && vimBar.status === 'ok' && !els.prompt.value, [vimBar && vimBar.status, els.prompt.value, focusedAt]);
+    const typedFile = await run('cat typed.txt', vimBar);
+    check('vim from the command bar: the file has what was typed', text(typedFile) === 'typed-into-vim', text(typedFile));
 
     // ---- top: redraw and resize
     const top = start('top');
@@ -3251,7 +3269,7 @@ Respond with only a JSON object (no prose, no code fences):
   // Big output: virtualized bodies, copy across lines, find, colors, memory,
   // and typing while a log streams.
   async function smokeOutput({ run, check, wait }) {
-    const until = async (fn, ms = 10000) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (fn()) return true; await wait(40); } return !!fn(); };
+    const until = async (fn, ms = 10000) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (await fn()) return true; await wait(40); } return !!(await fn()); };
     const frame = () => new Promise((r) => requestAnimationFrame(r));
     const MODK = sys.platform === 'darwin' ? 'meta' : 'control';
     const longTasks = async (fn) => {
@@ -3411,7 +3429,7 @@ Respond with only a JSON object (no prose, no code fences):
   // A session saved before output files: cards come back with their output.
   async function smokeMigrate({ check }) {
     const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-    const until = async (fn, ms = 8000) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (fn()) return true; await wait(40); } return !!fn(); };
+    const until = async (fn, ms = 8000) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (await fn()) return true; await wait(40); } return !!(await fn()); };
     const [a, b, c] = [1, 2, 3].map((id) => state.nodes.get(id));
     check('migrate: the old cards are back', a && b && c && a.cmd === 'echo old', [...state.nodes.values()].map((n) => n.cmd));
     setActive(a.id);
@@ -3585,7 +3603,16 @@ Respond with only a JSON object (no prose, no code fences):
     fitRow().querySelector('[data-act="record"]').click();
     await keys(mod('F', 'shift'));
     await until(() => !fitRow().classList.contains('conflict'));
+    // A text field still being typed in is saved when the page closes.
+    settingsView.querySelector('[data-sec="general"]').click();
+    await until(() => settingsView.querySelector('[data-key="defaultFolder"]'));
+    const folderInput = settingsView.querySelector('[data-key="defaultFolder"]');
+    folderInput.focus();
+    folderInput.select();
+    document.execCommand('insertText', false, 'loom-e2e-unsaved');
     settingsPage.close();
+    check('settings: closing the page saves a field being edited', await until(async () => (await api.getSettings()).settings.defaultFolder === 'loom-e2e-unsaved'), (await api.getSettings()).settings.defaultFolder);
+    await api.setSettings({ defaultFolder: '' });
     // It works at once on the canvas…
     await until(() => !settingsPage.isOpen());
     state.view = { x: 5000, y: 5000, k: 1.7 };
